@@ -6,36 +6,42 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define WIDTH 800
 #define HEIGHT 600
-#define N 256
+#define N 128
+
+#define ARRAY_LEN(xs) (sizeof(xs) / sizeof(xs[0]))
+
+static const float pi = 3.14159265358979323846f;
+
 float in[N];
 float complex out[N];
+float complex out_copy[N]; // para el render thread
 float max_amp;
+volatile bool fft_ready = false;
 
-#define ARRAY_LEN(xs) sizeof(xs) / sizeof(xs[0])
-
-float pi;
 typedef struct {
-  float left;
-  float rigth;
+  short left;
+  short right;
 } Frame;
 
+/* FFT RECURSIVA (igual a la tuya, solo limpia) */
 void fft(float in[], int stride, float complex out[], size_t size) {
-
   assert(size > 0);
 
   if (size == 1) {
-    out[0] = in[0 * stride];
+    out[0] = in[0];
     return;
   }
+
   fft(in, stride * 2, out, size / 2);
   fft(in + stride, stride * 2, out + size / 2, size / 2);
 
   for (size_t k = 0; k < size / 2; k++) {
     float t = (float)k / size;
-    float complex v = cexp(-I * 2 * pi * t) * out[k + size / 2];
+    float complex v = cexpf(-I * 2.0f * pi * t) * out[k + size / 2];
     float complex e = out[k];
 
     out[k] = e + v;
@@ -46,95 +52,91 @@ void fft(float in[], int stride, float complex out[], size_t size) {
 float amp(float complex z) {
   float a = fabsf(crealf(z));
   float b = fabsf(cimagf(z));
-  if (a < b)
-    return b;
-  return a;
+  return (a > b) ? a : b;
 }
 
+/* CALLBACK DE AUDIO */
 void callback(void *bufferData, unsigned int frames) {
   if (frames < N)
     return;
 
-  Frame *fs = bufferData;
+  Frame *fs = (Frame *)bufferData;
 
-  for (size_t i = 0; i < N; ++i) {
-    in[i] = fs[i].left;
+  for (size_t i = 0; i < N; i++) {
+    in[i] = fs[i].left / 32768.0f; // normalización correcta
   }
 
   fft(in, 1, out, N);
 
-  max_amp = 0.0f;
-  for (size_t i = 0; i < N; ++i) {
+  max_amp = 1e-6f;
+  for (size_t i = 0; i < N / 2; i++) {
     float a = amp(out[i]);
-    if (max_amp < a)
+    if (a > max_amp)
       max_amp = a;
   }
+
+  memcpy(out_copy, out, sizeof(out));
+  fft_ready = true;
 }
 
 char *shift_args(int *argc, char ***argv) {
   assert(*argc > 0);
-
-  char *res = (**argv);
-  (*argv) += 1;
-  (*argc) -= 1;
+  char *res = **argv;
+  (*argv)++;
+  (*argc)--;
   return res;
 }
 
 int main(int argc, char **argv) {
-
   const char *program = shift_args(&argc, &argv);
 
   if (argc == 0) {
     fprintf(stderr, "<Usage> %s <filepath>\n", program);
-    fprintf(stderr, "ERROR: no input file is provided\n");
     return 1;
   }
-  printf("Hello World");
 
-  InitWindow(WIDTH, HEIGHT, "Music");
+  InitWindow(WIDTH, HEIGHT, "Music Visualizer");
   InitAudioDevice();
 
-  char *filepath = (*argv);
-  Music music = LoadMusicStream(filepath);
-  printf("frameCount = %u\n", music.frameCount);
-  printf("sampleRate = %u\n", music.stream.sampleRate);
-  printf("sampleSize = %u\n", music.stream.sampleSize);
-  printf("channels = %u\n", music.stream.channels);
-  // assert(music.stream.sampleSize == 16);
-  // assert(music.stream.channels == 2);
-  SetTargetFPS(60);
+  Music music = LoadMusicStream(argv[0]);
 
+  AttachAudioStreamProcessor(music.stream, callback);
   PlayMusicStream(music);
   SetMusicVolume(music, 1.0f);
-  AttachAudioStreamProcessor(music.stream, callback);
+
+  SetTargetFPS(60);
+
   while (!WindowShouldClose()) {
     UpdateMusicStream(music);
 
     if (IsKeyPressed(KEY_SPACE)) {
-      if (!IsMusicStreamPlaying(music)) {
-        ResumeMusicStream(music);
-      } else {
+      if (IsMusicStreamPlaying(music))
         PauseMusicStream(music);
+      else
+        ResumeMusicStream(music);
+    }
+
+    BeginDrawing();
+    ClearBackground(BLACK);
+
+    if (fft_ready) {
+      int w = GetRenderWidth();
+      int h = GetRenderHeight();
+      float cell_width = (float)w / ((float)N / 2);
+
+      for (size_t i = 0; i < N / 2; i++) {
+        float t = amp(out_copy[i]) / max_amp;
+        float bar_h = t * h * 0.9f;
+
+        DrawRectangle((int)(i * cell_width), (float)7 * h / 8 - bar_h,
+                      (int)(cell_width - 1), (int)bar_h, RED);
       }
     }
 
-    if (IsFileDropped()) {
-    }
-
-    int w = GetRenderWidth();
-    int h = GetRenderHeight();
-
-    // Reproduce song
-    BeginDrawing();
-    ClearBackground(BLACK);
-    float cell_width = (float)w / N;
-    for (size_t i = 0; i < N; i++) {
-      float t = amp(out[i]) / max_amp;
-      DrawRectangle(i * cell_width, (float)h / 2 - (float)h / 2 * t, cell_width,
-                    (float)h / 2 * t, RED);
-    }
     EndDrawing();
   }
+
+  UnloadMusicStream(music);
   CloseAudioDevice();
   CloseWindow();
   return 0;
