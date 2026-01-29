@@ -1,3 +1,19 @@
+# Quick Start:
+
+```bash
+$ ./build.sh
+$ ./build/music <song_path>
+```
+
+# Hot Reloading:
+
+```bash
+$ export HOTRELOAD=1
+$ export LD_LIBRARY_PATH="./build/:$LD_LIBRARY_PATH"
+$ ./build.sh
+$ ./build/musualizer <song.ogg>
+```
+
 # References: 
 
 - https://www.raylib.com/
