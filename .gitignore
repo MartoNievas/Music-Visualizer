@@ -1,0 +1,4 @@
+*.o
+music
+fft
+*.mp3
