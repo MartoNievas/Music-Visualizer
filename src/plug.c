@@ -2,17 +2,15 @@
 #include <assert.h>
 #include <math.h>
 #include <raylib.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
-#define N 128
-
-static const float pi = 3.14159265358979323846f;
+#define N 256
+static const float pi;
 
 float in[N];
 float complex out[N];
-float complex out_copy[N]; // para el render thread
 float max_amp;
-volatile bool fft_ready = false;
 
 typedef struct {
   short left;
@@ -43,31 +41,18 @@ void fft(float in[], int stride, float complex out[], size_t size) {
 float amp(float complex z) {
   float a = fabsf(crealf(z));
   float b = fabsf(cimagf(z));
-  return (a > b) ? a : b;
+  if (a < b)
+    return b;
+  return a;
 }
 
-/* CALLBACK DE AUDIO */
 void callback(void *bufferData, unsigned int frames) {
-  if (frames < N)
-    return;
+  Frame *fs = bufferData;
 
-  Frame *fs = (Frame *)bufferData;
-
-  for (size_t i = 0; i < N; i++) {
-    in[i] = fs[i].left / 32768.0f; // normalización correcta
+  for (size_t i = 0; i < frames; ++i) {
+    memmove(in, in + 1, (N - 1) * sizeof(in[0]));
+    in[N - 1] = fs[i].left;
   }
-
-  fft(in, 1, out, N);
-
-  max_amp = 1e-6f;
-  for (size_t i = 0; i < N / 2; i++) {
-    float a = amp(out[i]);
-    if (a > max_amp)
-      max_amp = a;
-  }
-
-  memcpy(out_copy, out, sizeof(out));
-  fft_ready = true;
 }
 
 void plug_hello(void) { printf("Hello from plugin\n"); }
@@ -96,28 +81,63 @@ void plug_update(Plug *plug) {
   UpdateMusicStream(plug->music);
 
   if (IsKeyPressed(KEY_SPACE)) {
-    if (IsMusicStreamPlaying(plug->music))
+    if (IsMusicStreamPlaying(plug->music)) {
       PauseMusicStream(plug->music);
-    else
+    } else {
       ResumeMusicStream(plug->music);
-  }
-
-  BeginDrawing();
-  ClearBackground(BLACK);
-
-  if (fft_ready) {
-    int w = GetRenderWidth();
-    int h = GetRenderHeight();
-    float cell_width = (float)w / ((float)N / 2);
-
-    for (size_t i = 0; i < N / 2; i++) {
-      float t = amp(out_copy[i]) / max_amp;
-      float bar_h = t * h * 0.9f;
-
-      DrawRectangle((int)(i * cell_width), (float)7 * h / 8 - bar_h,
-                    (int)(cell_width - 1), (int)bar_h, RED);
     }
   }
 
+  if (IsKeyPressed(KEY_Q)) {
+    StopMusicStream(plug->music);
+    PlayMusicStream(plug->music);
+  }
+
+  int w = GetRenderWidth();
+  int h = GetRenderHeight();
+
+  BeginDrawing();
+  ClearBackground(CLITERAL(Color){0x18, 0x18, 0x18, 0xFF});
+
+  fft(in, 1, out, N);
+
+  float max_amp = 0.0f;
+  for (size_t i = 0; i < N; ++i) {
+    float a = amp(out[i]);
+    if (max_amp < a)
+      max_amp = a;
+  }
+
+  float step = 1.06;
+  size_t m = 0;
+  for (float f = 20.0f; (size_t)f < N; f *= step) {
+    m += 1;
+  }
+
+  float cell_width = (float)w / m;
+  m = 0;
+  for (float f = 20.0f; (size_t)f < N; f *= step) {
+    float f1 = f * step;
+    float a = 0.0f;
+    for (size_t q = (size_t)f; q < N && q < (size_t)f1; ++q) {
+      a += amp(out[q]);
+    }
+    a /= (size_t)f1 - (size_t)f + 1;
+    float t = a / max_amp;
+    DrawRectangle(m * cell_width, h / 2 - h / 2 * t, cell_width, h / 2 * t,
+                  GREEN);
+    // DrawCircle(m*cell_width, h/2, h/2*t, GREEN);
+    m += 1;
+  }
   EndDrawing();
+}
+
+void plug_world(void) { printf("Foo Bar\n"); }
+
+void plug_pre_reload(Plug *plug) {
+  DetachAudioStreamProcessor(plug->music.stream, callback);
+}
+
+void plug_post_reload(Plug *plug) {
+  AttachAudioStreamProcessor(plug->music.stream, callback);
 }

@@ -84,6 +84,16 @@ int main(int argc, char **argv) {
   plug_init(&plug, file_path);
   while (!WindowShouldClose()) {
     plug_update(&plug);
+    if (IsKeyPressed(KEY_R)) {
+      plug_pre_reload(&plug);
+      if (!reload_libplug())
+        return 1;
+      plug_post_reload(&plug);
+    }
+
+    if (IsKeyPressed(KEY_W)) {
+      plug_world();
+    }
   }
 
   return 0;
