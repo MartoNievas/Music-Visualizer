@@ -1,28 +1,42 @@
 #include "plug.h"
+
 #include <assert.h>
+#include <complex.h>
 #include <math.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define N (1 << 13)
-#define FONT_SIZE 69
+#include <raylib.h>
+
+#define N (1 << 13) // FFT size (8192)
+#define BARS 64
+#define FONT_SIZE 64
+#define PI 3.14159265358979323846f
 
 typedef struct {
   Music music;
   Font font;
   bool error;
+  bool has_music; // hay música cargada
+  bool paused;    // está pausada
+  unsigned sample_rate;
 } Plug;
 
-Plug *plug = NULL;
+static Plug *plug = NULL;
 
-float in[N];
-float complex out[N];
+/* ===================== AUDIO DATA ===================== */
 
-// Ported from https://rosettacode.org/wiki/Fast_Fourier_transform#Python
-void fft(float in[], size_t stride, float complex out[], size_t n) {
-  assert(n > 0);
+static float samples[N];
+static float window[N];
+static float complex spectrum[N];
+static float bars[BARS];
+static bool window_ready = false;
 
+/* ===================== FFT ===================== */
+
+static void fft(float in[], size_t stride, float complex out[], size_t n) {
   if (n == 1) {
     out[0] = in[0];
     return;
@@ -31,155 +45,211 @@ void fft(float in[], size_t stride, float complex out[], size_t n) {
   fft(in, stride * 2, out, n / 2);
   fft(in + stride, stride * 2, out + n / 2, n / 2);
 
-  for (size_t k = 0; k < n / 2; ++k) {
+  for (size_t k = 0; k < n / 2; k++) {
     float t = (float)k / n;
-    float complex v = cexp(-2 * I * PI * t) * out[k + n / 2];
+    float complex v = cexpf(-2.0f * I * PI * t) * out[k + n / 2];
     float complex e = out[k];
     out[k] = e + v;
     out[k + n / 2] = e - v;
   }
 }
 
-float amp(float complex z) {
+static float amp(float complex z) {
   float a = fabsf(crealf(z));
   float b = fabsf(cimagf(z));
-  if (a < b)
-    return b;
-  return a;
+  return (a > b) ? a : b;
 }
 
-void callback(void *bufferData, unsigned int frames) {
-  // https://cdecl.org/?q=float+%28*fs%29%5B2%5D
+/* ===================== AUDIO CALLBACK ===================== */
+
+static void audio_callback(void *bufferData, unsigned int frames) {
   float (*fs)[plug->music.stream.channels] = bufferData;
 
-  for (size_t i = 0; i < frames; ++i) {
-    memmove(in, in + 1, (N - 1) * sizeof(in[0]));
-    in[N - 1] = fs[i][0];
+  for (unsigned i = 0; i < frames; i++) {
+    memmove(samples, samples + 1, (N - 1) * sizeof(float));
+    samples[N - 1] = fs[i][0];
   }
 }
 
+/* ===================== INIT ===================== */
+
 void plug_init(void) {
-  plug = malloc(sizeof(*plug));
-  assert(plug != NULL && "Buy more RAM lol");
-  memset(plug, 0, sizeof(*plug));
+  plug = calloc(1, sizeof(*plug));
+  assert(plug);
 
   plug->font = LoadFontEx("./fonts/Alegreya-Regular.ttf", FONT_SIZE, NULL, 0);
+
+  memset(samples, 0, sizeof(samples));
+  memset(bars, 0, sizeof(bars));
 }
+
+/* ===================== HOT RELOAD ===================== */
+
 Plug *plug_pre_reload(void) {
-  if (IsMusicStreamPlaying(plug->music)) {
-    DetachAudioStreamProcessor(plug->music.stream, callback);
+  if (plug->has_music) {
+    DetachAudioStreamProcessor(plug->music.stream, audio_callback);
   }
   return plug;
 }
 
 void plug_post_reload(Plug *prev) {
   plug = prev;
-  if (IsMusicStreamPlaying(plug->music)) {
-    AttachAudioStreamProcessor(plug->music.stream, callback);
+  if (plug->has_music) {
+    AttachAudioStreamProcessor(plug->music.stream, audio_callback);
   }
 }
 
-void plug_update(void) {
-  if (IsMusicStreamPlaying(plug->music)) {
-    UpdateMusicStream(plug->music);
-  }
+/* ===================== UPDATE ===================== */
 
-  if (IsKeyPressed(KEY_SPACE)) {
-    if (IsMusicStreamPlaying(plug->music)) {
-      PauseMusicStream(plug->music);
-    } else {
-      ResumeMusicStream(plug->music);
-    }
-  }
-
-  if (IsKeyPressed(KEY_Q)) {
-    if (IsMusicStreamPlaying(plug->music)) {
-      StopMusicStream(plug->music);
-      PlayMusicStream(plug->music);
-    }
-  }
-
-  if (IsFileDropped()) {
-    FilePathList droppedFiles = LoadDroppedFiles();
-    if (droppedFiles.count > 0) {
-      const char *file_path = droppedFiles.paths[0];
-
-      if (IsMusicStreamPlaying(plug->music)) {
-        StopMusicStream(plug->music);
-        UnloadMusicStream(plug->music);
-      }
-
-      plug->music = LoadMusicStream(file_path);
-
-      if (plug->music.stream.buffer != NULL) {
-        plug->error = false;
-        printf("music.frameCount = %u\n", plug->music.frameCount);
-        printf("music.stream.sampleRate = %u\n", plug->music.stream.sampleRate);
-        printf("music.stream.sampleSize = %u\n", plug->music.stream.sampleSize);
-        printf("music.stream.channels = %u\n", plug->music.stream.channels);
-        SetMusicVolume(plug->music, 0.5f);
-        AttachAudioStreamProcessor(plug->music.stream, callback);
-        PlayMusicStream(plug->music);
-      } else {
-        plug->error = true;
-      }
-    }
-    UnloadDroppedFiles(droppedFiles);
-  }
-
+static void bars_render_visualizer(void) {
   int w = GetRenderWidth();
   int h = GetRenderHeight();
 
   BeginDrawing();
-  ClearBackground(CLITERAL(Color){0x18, 0x18, 0x18, 0xFF});
+  ClearBackground((Color){0x18, 0x18, 0x18, 0xFF});
 
-  if (IsMusicStreamPlaying(plug->music)) {
-    fft(in, 1, out, N);
+  if (plug->has_music) {
+    float cw = (float)w / BARS;
 
-    float max_amp = 0.0f;
-    for (size_t i = 0; i < N; ++i) {
-      float a = amp(out[i]);
-      if (max_amp < a)
+    for (int i = 0; i < BARS; i++) {
+      float bh = bars[i] * h * 0.9f;
+      DrawRectangle(i * cw, h - bh, cw - 2, bh, GREEN);
+    }
+  } else {
+    const char *msg = plug->error
+                          ? "Could not load file"
+                          : " Select File On Click\n (Or Just Drop Here)";
+
+    Color col = plug->error ? RED : WHITE;
+
+    Vector2 size = MeasureTextEx(plug->font, msg, plug->font.baseSize, 0);
+
+    DrawTextEx(plug->font, msg,
+               (Vector2){(float)w / 2 - size.x / 2, (float)h / 2 - size.y / 2},
+               plug->font.baseSize, 0, col);
+  }
+
+  EndDrawing();
+}
+
+static void fft_render_visualizar(void) {
+  if (plug->has_music && !plug->paused) {
+
+    if (!window_ready) {
+      for (size_t i = 0; i < N; i++) {
+        window[i] = 0.5f * (1.0f - cosf(2.0f * PI * i / (N - 1)));
+      }
+      window_ready = true;
+    }
+
+    float tmp[N];
+    for (size_t i = 0; i < N; i++) {
+      tmp[i] = samples[i] * window[i];
+    }
+
+    fft(tmp, 1, spectrum, N);
+
+    float max_amp = 1e-6f;
+    for (size_t i = 0; i < N / 2; i++) {
+      float a = amp(spectrum[i]);
+      if (a > max_amp)
         max_amp = a;
     }
 
-    float step = 1.06;
-    size_t m = 0;
-    for (float f = 20.0f; (size_t)f < N; f *= step) {
-      m += 1;
-    }
+    float freq_min = 20.0f;
+    float freq_max = plug->sample_rate * 0.5f;
 
-    float cell_width = (float)w / m;
-    m = 0;
-    for (float f = 20.0f; (size_t)f < N; f *= step) {
-      float f1 = f * step;
+    for (int i = 0; i < BARS; i++) {
+      float t0 = (float)i / BARS;
+      float t1 = (float)(i + 1) / BARS;
+
+      float f0 = freq_min * powf(freq_max / freq_min, t0);
+      float f1 = freq_min * powf(freq_max / freq_min, t1);
+
+      size_t k0 = (size_t)(f0 * N / plug->sample_rate);
+      size_t k1 = (size_t)(f1 * N / plug->sample_rate);
+      if (k1 <= k0)
+        k1 = k0 + 1;
+
       float a = 0.0f;
-      for (size_t q = (size_t)f; q < N && q < (size_t)f1; ++q) {
-        a += amp(out[q]);
+      for (size_t k = k0; k < k1 && k < N / 2; k++) {
+        a += amp(spectrum[k]);
       }
-      a /= (size_t)f1 - (size_t)f + 1;
-      float t = a / max_amp;
-      DrawRectangle(m * cell_width, (float)h / 2 - (float)h / 2 * t, cell_width,
-                    (float)h / 2 * t, GREEN);
-      // DrawCircle(m*cell_width, h/2, h/2*t, GREEN);
-      m += 1;
+      a /= (k1 - k0);
+
+      float target = a / max_amp;
+      bars[i] += 0.2f * (target - bars[i]); // smoothing
     }
-  } else {
-    const char *label;
-    Color color;
-    if (plug->error) {
-      label = "Could not load file";
-      color = RED;
-    } else {
-      label = "Drag&Drop Music Here";
-      color = WHITE;
-    }
-    Vector2 size = MeasureTextEx(plug->font, label, plug->font.baseSize, 0);
-    Vector2 position = {
-        (float)w / 2 - size.x / 2,
-        (float)h / 2 - size.y / 2,
-    };
-    DrawTextEx(plug->font, label, position, plug->font.baseSize, 0, color);
   }
-  EndDrawing();
+}
+
+static void input_visualizer(void) {
+  if (IsKeyPressed(KEY_SPACE) && plug->has_music) {
+    if (plug->paused) {
+      ResumeMusicStream(plug->music);
+      plug->paused = false;
+    } else {
+      PauseMusicStream(plug->music);
+      plug->paused = true;
+    }
+  }
+
+  if (IsKeyPressed(KEY_Q) && plug->has_music) {
+    StopMusicStream(plug->music);
+    PlayMusicStream(plug->music);
+    plug->paused = false;
+  }
+}
+
+static void file_dropped_visualizer(void) {
+  if (IsFileDropped()) {
+    FilePathList files = LoadDroppedFiles();
+    if (files.count > 0) {
+      const char *path = files.paths[0];
+
+      if (plug->has_music) {
+        StopMusicStream(plug->music);
+        DetachAudioStreamProcessor(plug->music.stream, audio_callback);
+        UnloadMusicStream(plug->music);
+      }
+
+      plug->music = LoadMusicStream(path);
+
+      if (plug->music.stream.buffer) {
+        plug->error = false;
+        plug->has_music = true;
+        plug->paused = false;
+        plug->sample_rate = plug->music.stream.sampleRate;
+
+        AttachAudioStreamProcessor(plug->music.stream, audio_callback);
+        SetMusicVolume(plug->music, 0.5f);
+        PlayMusicStream(plug->music);
+      } else {
+        plug->error = true;
+        plug->has_music = false;
+      }
+    }
+    UnloadDroppedFiles(files);
+  }
+}
+
+void plug_update(void) {
+  /*Update music*/
+  if (plug->has_music && !plug->paused) {
+    UpdateMusicStream(plug->music);
+  }
+
+  /* ---------- INPUT ---------- */
+
+  input_visualizer();
+
+  /* ---------- FILE DROP ---------- */
+
+  file_dropped_visualizer();
+  /* FFT RENDER */
+
+  fft_render_visualizar();
+
+  /* ---------- RENDER ---------- */
+  bars_render_visualizer();
 }
