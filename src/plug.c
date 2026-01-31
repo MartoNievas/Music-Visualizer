@@ -174,11 +174,12 @@ static void bars_render_visualizer(void) {
 
     for (int i = 0; i < BARS; i++) {
       float bh = bars[i] * h * 0.9f;
+      float bh1 = bars[i] * h * 0.75f;
       if (plug->fullscreen) {
         DrawRectangle(i * cw, h - bh - h * 0.05f, cw - 2, bh, GREEN);
       } else {
-        DrawRectangle(i * cw + 0.23f * w, (h - bh) - 150 - h * 0.05f, cw - 2,
-                      bh, GREEN);
+        DrawRectangle(i * cw + 0.23f * w, (h - bh1) - 150 - h * 0.05f, cw - 2,
+                      bh1, GREEN);
       }
     }
   } else {
