@@ -10,8 +10,6 @@
 #include <dlfcn.h>
 
 #include "plug.h"
-#include "tinyfiledialogs.h"
-#define ARRAY_LEN(xs) sizeof(xs) / sizeof(xs[0])
 
 const char *libplug_file_name = "libplug.so";
 void *libplug = NULL;
@@ -71,11 +69,6 @@ int main(void) {
       if (!reload_libplug())
         return 1;
       plug_post_reload(state);
-    }
-
-    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-      printf("Left Button Is Pressed\n");
-      tinyfd_openFileDialog("Select Music File", "~/", 0, NULL, NULL, 0);
     }
 
     plug_update();
