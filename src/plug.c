@@ -12,45 +12,44 @@
 #include <raylib.h>
 
 #include "tinyfiledialogs.h"
-#define N (1 << 13) // FFT size (8192)
+
+#define N (1 << 13)
 #define BARS 64
 #define FONT_SIZE 64
 #define PI 3.14159265358979323846f
 
 #define ARRAY_LEN(xs) sizeof(xs) / sizeof(xs[0])
+
 typedef struct {
+
+  // Resoruces
   Music music;
   Font font;
+
+  // Control
   bool error;
   bool has_music;
   bool paused;
+  bool fullscreen;
   unsigned sample_rate;
 } Plug;
 
-typedef struct {
-  char *file_path;
-  Music music;
-} Track;
+typedef enum {
+  PLAY_UI_ICON,
+  FULLSCREEN_UI_ICON,
+  VOLUME_UI_ICON,
+  COUNT_UI_ICONS,
+} Ui_Icon;
 
-typedef struct {
-  Track *items;
-  size_t count;
-  size_t capacity;
-} Tracks;
-
-typedef enum { PAUSE_BUTTON, FULLSCREEN } UiElems;
+static_assert(COUNT_UI_ICONS == 3, "Amount of icons changed");
 
 static Plug *plug = NULL;
-Tracks tracks = {0};
-/* ===================== AUDIO DATA ===================== */
 
 static float samples[N];
 static float window[N];
 static float complex spectrum[N];
 static float bars[BARS];
 static bool window_ready = false;
-
-/* ===================== FFT ===================== */
 
 static void fft(float in[], size_t stride, float complex out[], size_t n) {
   if (n == 1) {
@@ -76,8 +75,6 @@ static float amp(float complex z) {
   return (a > b) ? a : b;
 }
 
-/* ===================== AUDIO CALLBACK ===================== */
-
 static void audio_callback(void *bufferData, unsigned int frames) {
   float (*fs)[plug->music.stream.channels] = bufferData;
 
@@ -87,19 +84,17 @@ static void audio_callback(void *bufferData, unsigned int frames) {
   }
 }
 
-/* ===================== INIT ===================== */
-
 void plug_init(void) {
   plug = calloc(1, sizeof(*plug));
   assert(plug);
 
-  plug->font = LoadFontEx("./fonts/Alegreya-Regular.ttf", FONT_SIZE, NULL, 0);
+  plug->font =
+      LoadFontEx("./resources/fonts/Alegreya-Regular.ttf", FONT_SIZE, NULL, 0);
 
+  plug->fullscreen = false;
   memset(samples, 0, sizeof(samples));
   memset(bars, 0, sizeof(bars));
 }
-
-/* ===================== HOT RELOAD ===================== */
 
 Plug *plug_pre_reload(void) {
   if (plug->has_music) {
@@ -115,10 +110,8 @@ void plug_post_reload(Plug *prev) {
   }
 }
 
-/* ===================== UPDATE ===================== */
-
 static void draw_progress_bar(void) {
-  if (!plug->has_music)
+  if (!plug->has_music || plug->fullscreen)
     return;
 
   float played = GetMusicTimePlayed(plug->music);
@@ -135,26 +128,38 @@ static void draw_progress_bar(void) {
   int w = GetRenderWidth();
   int h = GetRenderHeight();
 
-  float x = t * (float)w;
+  float x = t * w;
   float bar_width = 6.0f;
 
-  // BackGround
   DrawRectangle(0, h - 150, w, 200, BLACK);
-  // progress bar
   DrawRectangle(x - bar_width * 0.5f, h - 150, bar_width, 200,
                 (Color){100, 180, 255, 220});
 
-  // Interactive
-  if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-    Vector2 mouse_position = GetMousePosition();
-    int x_current = mouse_position.x;
-    int y_current = mouse_position.y;
-    if ((x_current >= 0 && x_current < w) &&
-        (y_current >= h - 150 && y_current < h)) {
-      t = (float)x_current / w;
-      SeekMusicStream(plug->music, total * t);
+  if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+    Vector2 m = GetMousePosition();
+    if (m.y >= h - 150 && m.y < h) {
+      float nt = m.x / (float)w;
+      if (nt < 0)
+        nt = 0;
+      if (nt > 1)
+        nt = 1;
+      SeekMusicStream(plug->music, total * nt);
     }
   }
+}
+
+static void draw_tracks_queue(void) {
+  if (plug->fullscreen || !plug->has_music)
+    return;
+
+  int w = GetRenderWidth();
+  int h = GetRenderHeight();
+
+  float queue_width = w * 0.23f;
+  float queue_height = h - 150;
+
+  DrawRectangle(0, 0, queue_width, queue_height,
+                (Color){0x10, 0x10, 0x10, 0xFF});
 }
 
 static void bars_render_visualizer(void) {
@@ -169,7 +174,12 @@ static void bars_render_visualizer(void) {
 
     for (int i = 0; i < BARS; i++) {
       float bh = bars[i] * h * 0.9f;
-      DrawRectangle(i * cw, (h - bh) - 150, cw - 2, bh, GREEN);
+      if (plug->fullscreen) {
+        DrawRectangle(i * cw, h - bh - h * 0.05f, cw - 2, bh, GREEN);
+      } else {
+        DrawRectangle(i * cw + 0.23f * w, (h - bh) - 150 - h * 0.05f, cw - 2,
+                      bh, GREEN);
+      }
     }
   } else {
     const char *msg = plug->error
@@ -177,11 +187,10 @@ static void bars_render_visualizer(void) {
                           : " Select File On Click\n (Or Just Drop Here)";
 
     Color col = plug->error ? RED : WHITE;
-
     Vector2 size = MeasureTextEx(plug->font, msg, plug->font.baseSize, 0);
 
     DrawTextEx(plug->font, msg,
-               (Vector2){(float)w / 2 - size.x / 2, (float)h / 2 - size.y / 2},
+               (Vector2){w / 2.0f - size.x / 2, h / 2.0f - size.y / 2},
                plug->font.baseSize, 0, col);
   }
 
@@ -190,7 +199,6 @@ static void bars_render_visualizer(void) {
 
 static void fft_render_visualizar(void) {
   if (plug->has_music && !plug->paused) {
-
     if (!window_ready) {
       for (size_t i = 0; i < N; i++) {
         window[i] = 0.5f * (1.0f - cosf(2.0f * PI * i / (N - 1)));
@@ -234,12 +242,43 @@ static void fft_render_visualizar(void) {
       a /= (k1 - k0);
 
       float target = a / max_amp;
-      bars[i] += 0.2f * (target - bars[i]); // smoothing
+      bars[i] += 0.2f * (target - bars[i]);
     }
   }
 }
 
+static void draw_iu_icons_bar(void) {
+  if (!plug->has_music)
+    return;
+  int w = GetRenderWidth();
+  int h = GetRenderHeight();
+
+  Rectangle bar_background;
+  if (plug->fullscreen) {
+    bar_background = (Rectangle){
+        .height = h * 0.05f,
+        .width = w,
+        .x = 0,
+        .y = h - h * 0.05f,
+    };
+
+  } else {
+    bar_background = (Rectangle){
+        .x = w * 0.23f,
+        .y = h - 150 - h * 0.05f,
+        .width = w - w * 0.23f,
+        .height = h * 0.05f,
+    };
+  }
+
+  DrawRectangleRec(bar_background, (Color){0x10, 0x10, 0x10, 0xFF});
+}
+
 static void input_visualizer(void) {
+  if (IsKeyPressed(KEY_F)) {
+    plug->fullscreen = !plug->fullscreen;
+  }
+
   if (IsKeyPressed(KEY_SPACE) && plug->has_music) {
     if (plug->paused) {
       ResumeMusicStream(plug->music);
@@ -248,12 +287,6 @@ static void input_visualizer(void) {
       PauseMusicStream(plug->music);
       plug->paused = true;
     }
-  }
-
-  if (IsKeyPressed(KEY_Q) && plug->has_music) {
-    StopMusicStream(plug->music);
-    PlayMusicStream(plug->music);
-    plug->paused = false;
   }
 }
 
@@ -276,7 +309,6 @@ static void file_dropped_visualizer(void) {
         plug->has_music = true;
         plug->paused = false;
         plug->sample_rate = plug->music.stream.sampleRate;
-
         AttachAudioStreamProcessor(plug->music.stream, audio_callback);
         SetMusicVolume(plug->music, 0.5f);
         PlayMusicStream(plug->music);
@@ -290,24 +322,17 @@ static void file_dropped_visualizer(void) {
 }
 
 void plug_update(void) {
-  /*Update music*/
   if (plug->has_music && !plug->paused) {
     UpdateMusicStream(plug->music);
   }
 
   if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && !plug->has_music) {
-    printf("Left Button Is Pressed\n");
-
-    int allow_multiple_selects = 0; // TODO: enable multiple selects
-    char const *filter_params[] = {"*.wav", "*.ogg", "*.mp3", "*.qoa",
-                                   "*.xm",  "*.mod", "*.flac"};
-    char const *input_path = tinyfd_openFileDialog(
-        "Path to music file", "./", ARRAY_LEN(filter_params), filter_params,
-        "music file", allow_multiple_selects);
-    if (input_path) {
-      Music music = LoadMusicStream(input_path);
+    char const *filters[] = {"*.wav", "*.ogg", "*.mp3", "*.flac"};
+    char const *path = tinyfd_openFileDialog(
+        "Select music", "./", ARRAY_LEN(filters), filters, "music", 0);
+    if (path) {
+      Music music = LoadMusicStream(path);
       if (IsMusicValid(music)) {
-
         plug->music = music;
         plug->has_music = true;
         plug->paused = false;
@@ -322,19 +347,12 @@ void plug_update(void) {
       }
     }
   }
-  /* ---------- INPUT ---------- */
 
   input_visualizer();
-
-  /* ---------- FILE DROP ---------- */
-
   file_dropped_visualizer();
-  /* FFT RENDER */
-
-  draw_progress_bar();
-
   fft_render_visualizar();
-
-  /* ---------- RENDER ---------- */
+  draw_tracks_queue();
+  draw_progress_bar();
+  draw_iu_icons_bar();
   bars_render_visualizer();
 }
