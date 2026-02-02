@@ -1,4 +1,3 @@
-
 #include <assert.h>
 #include <complex.h>
 #include <math.h>
@@ -33,34 +32,39 @@ typedef struct {
 
 typedef enum {
   PLAY_UI_ICON,
-  FULLSCREEN_UI_ICON,
   VOLUME_UI_ICON,
+  FULLSCREEN_UI_ICON,
   COUNT_UI_ICONS,
 } Ui_Icon;
 
 typedef struct {
 
-  // Resoruces
   Music music;
   Font font;
   Tracks tracks;
   Track current;
   Texture2D icons_textures[COUNT_UI_ICONS];
-  // Control
+
   bool error;
   bool has_music;
   bool paused;
   bool fullscreen;
   unsigned sample_rate;
 
-  // Mouse state
+  int volume_level; // 0..3
+
   double last_mouse_move_time;
   bool mouse_active;
 
 } Plug;
 
 static_assert(COUNT_UI_ICONS == 3, "Amount of icons changed");
+const static char *ui_resources_icons[COUNT_UI_ICONS] = {
+    [FULLSCREEN_UI_ICON] = "resources/icons/fullscreen.png",
+    [PLAY_UI_ICON] = "resources/icons/play.png",
+    [VOLUME_UI_ICON] = "resources/icons/volume.png"};
 
+static Rectangle ui_recs[COUNT_UI_ICONS];
 static Plug *plug = NULL;
 
 static float samples[N];
@@ -68,6 +72,15 @@ static float window[N];
 static float complex spectrum[N];
 static float bars[BARS];
 static bool window_ready = false;
+
+void plug_free_resource(void *data) { UnloadFileData(data); }
+
+void *plug_load_resoruces(const char *file_path, size_t *size) {
+  int data_size;
+  void *data = LoadFileData(file_path, &data_size);
+  *size = data_size;
+  return data;
+}
 
 static void update_mouse_activity(void) {
   if (!plug->fullscreen)
@@ -115,34 +128,6 @@ static void audio_callback(void *bufferData, unsigned int frames) {
   }
 }
 
-void plug_init(void) {
-  plug = calloc(1, sizeof(*plug));
-  assert(plug);
-
-  plug->font =
-      LoadFontEx("./resources/fonts/Alegreya-Regular.ttf", FONT_SIZE, NULL, 0);
-
-  plug->fullscreen = false;
-  plug->mouse_active = false;
-  plug->last_mouse_move_time = -100.0f;
-  memset(samples, 0, sizeof(samples));
-  memset(bars, 0, sizeof(bars));
-}
-
-Plug *plug_pre_reload(void) {
-  if (plug->has_music) {
-    DetachAudioStreamProcessor(plug->music.stream, audio_callback);
-  }
-  return plug;
-}
-
-void plug_post_reload(Plug *prev) {
-  plug = prev;
-  if (plug->has_music) {
-    AttachAudioStreamProcessor(plug->music.stream, audio_callback);
-  }
-}
-
 static void draw_progress_bar(void) {
   if (!plug->has_music || plug->fullscreen)
     return;
@@ -168,9 +153,18 @@ static void draw_progress_bar(void) {
   DrawRectangle(x - bar_width * 0.5f, h - 150, bar_width, 200,
                 (Color){100, 180, 255, 220});
 
-  if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+  if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
     Vector2 m = GetMousePosition();
-    if (m.y >= h - 150 && m.y < h) {
+
+    bool clicking_ui_button = false;
+    for (int i = 0; i < COUNT_UI_ICONS; i++) {
+      if (CheckCollisionPointRec(m, ui_recs[i])) {
+        clicking_ui_button = true;
+        break;
+      }
+    }
+
+    if (!clicking_ui_button && m.y >= h - 150 && m.y < h) {
       float nt = m.x / (float)w;
       if (nt < 0)
         nt = 0;
@@ -281,33 +275,82 @@ static void fft_render_visualizar(void) {
 static void draw_ui_icons_bar(void) {
   if (!plug->has_music)
     return;
+
   int w = GetRenderWidth();
   int h = GetRenderHeight();
 
-  Rectangle bar_background;
+  Rectangle bar;
   if (plug->fullscreen) {
-    /*If dont move mouse dont draw ui icons bar*/
-
     if (!plug->mouse_active)
       return;
 
-    bar_background = (Rectangle){
-        .height = h * 0.05f,
-        .width = w,
-        .x = 0,
-        .y = h - h * 0.05f,
+    bar = (Rectangle){
+        0,
+        h - h * 0.05f,
+        w,
+        h * 0.05f,
     };
-
   } else {
-    bar_background = (Rectangle){
-        .x = w * 0.23f,
-        .y = h - 150 - h * 0.05f,
-        .width = w - w * 0.23f,
-        .height = h * 0.05f,
+    bar = (Rectangle){
+        w * 0.23f,
+        h - 150 - h * 0.05f,
+        w - w * 0.23f,
+        h * 0.05f,
     };
   }
 
-  DrawRectangleRec(bar_background, (Color){0x10, 0x10, 0x10, 0xFF});
+  DrawRectangleRec(bar, (Color){0x10, 0x10, 0x10, 0xFF});
+
+  float padding = bar.height * 0.25f;
+  float icon_size = bar.height - padding * 2;
+  float y = bar.y + (bar.height - icon_size) * 0.5f;
+
+  float x_left = bar.x + padding;
+
+  /* PLAY / PAUSE */
+  {
+    Texture2D tex = plug->icons_textures[PLAY_UI_ICON];
+    float frame = plug->paused ? 0 : 1;
+    float s = tex.height;
+
+    Rectangle dst = {x_left, y, icon_size, icon_size};
+    Rectangle src = {frame * s, 0, s, s};
+
+    DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0, WHITE);
+    ui_recs[PLAY_UI_ICON] = dst;
+
+    x_left += icon_size + padding;
+  }
+
+  /* VOLUME */
+  {
+    Texture2D tex = plug->icons_textures[VOLUME_UI_ICON];
+    float frame = plug->volume_level;
+    float s = tex.height;
+
+    Rectangle dst = {x_left, y, icon_size, icon_size};
+    Rectangle src = {frame * s, 0, s, s};
+
+    DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0, WHITE);
+    ui_recs[VOLUME_UI_ICON] = dst;
+
+    x_left += icon_size + padding;
+  }
+
+  /* FULLSCREEN */
+  {
+    Texture2D tex = plug->icons_textures[FULLSCREEN_UI_ICON];
+    float frame = plug->fullscreen ? 1 : 0;
+    float s = tex.height;
+
+    float x_right = bar.x + bar.width - padding - icon_size;
+
+    Rectangle dst = {x_right, y, icon_size, icon_size};
+    Rectangle src = {frame * s, 0, s, s};
+
+    DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0, WHITE);
+    ui_recs[FULLSCREEN_UI_ICON] = dst;
+  }
 }
 
 static void input_visualizer(void) {
@@ -357,6 +400,82 @@ static void file_dropped_visualizer(void) {
   }
 }
 
+static void load_assets(void) {
+  size_t data_size = 0;
+  void *data = NULL;
+
+  const char *alegreya_path = "resources/fonts/Alegreya-Regular.ttf";
+  data = plug_load_resoruces(alegreya_path, &data_size);
+  plug->font = LoadFontFromMemory(GetFileExtension(alegreya_path), data,
+                                  data_size, FONT_SIZE, NULL, 0);
+
+  plug_free_resource(data);
+
+  for (Ui_Icon i = 0; i < COUNT_UI_ICONS; i++) {
+    data = plug_load_resoruces(ui_resources_icons[i], &data_size);
+    Image image = LoadImageFromMemory(GetFileExtension(ui_resources_icons[i]),
+                                      data, data_size);
+
+    plug->icons_textures[i] = LoadTextureFromImage(image);
+    GenTextureMipmaps(&plug->icons_textures[i]);
+    SetTextureFilter(plug->icons_textures[i], TEXTURE_FILTER_BILINEAR);
+    UnloadImage(image);
+    plug_free_resource(data);
+  }
+}
+
+static void unload_assets(void) {
+  UnloadFont(plug->font);
+  for (Ui_Icon icon = 0; icon < COUNT_UI_ICONS; icon++) {
+    UnloadTexture(plug->icons_textures[icon]);
+  }
+}
+
+void plug_post_reload(Plug *prev) {
+  plug = prev;
+  if (plug->has_music) {
+    AttachAudioStreamProcessor(plug->music.stream, audio_callback);
+  }
+  load_assets();
+}
+
+Plug *plug_pre_reload(void) {
+  if (plug->has_music) {
+    DetachAudioStreamProcessor(plug->music.stream, audio_callback);
+  }
+  unload_assets();
+
+  return plug;
+}
+
+static bool ui_bar_active(void) {
+  if (!plug->has_music)
+    return false;
+
+  if (plug->fullscreen)
+    return plug->mouse_active;
+
+  return true;
+}
+
+void plug_init(void) {
+  plug = calloc(1, sizeof(*plug));
+  assert(plug);
+
+  memset(plug, 0, sizeof(*plug));
+
+  load_assets();
+  plug->fullscreen = false;
+  plug->mouse_active = false;
+  plug->last_mouse_move_time = -100.0f;
+  plug->volume_level = 2;
+
+  memset(samples, 0, sizeof(samples));
+  memset(bars, 0, sizeof(bars));
+  SetMasterVolume(0.5f);
+  SetTargetFPS(60);
+}
+
 void plug_update(void) {
   if (plug->has_music && !plug->paused) {
     UpdateMusicStream(plug->music);
@@ -395,6 +514,32 @@ void plug_update(void) {
   draw_tracks_queue();
   draw_progress_bar();
   draw_ui_icons_bar();
+
+  if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && ui_bar_active()) {
+    Vector2 m = GetMousePosition();
+
+    if (CheckCollisionPointRec(m, ui_recs[PLAY_UI_ICON])) {
+      plug->paused = !plug->paused;
+
+      if (plug->paused)
+        PauseMusicStream(plug->music);
+      else
+        ResumeMusicStream(plug->music);
+    }
+
+    else if (CheckCollisionPointRec(m, ui_recs[VOLUME_UI_ICON])) {
+      float vol = GetMasterVolume();
+      vol += 0.1f;
+      if (vol > 1.0f)
+        vol = 0.0f;
+      SetMusicVolume(plug->music, vol);
+    }
+
+    else if (CheckCollisionPointRec(m, ui_recs[FULLSCREEN_UI_ICON])) {
+      plug->fullscreen = !plug->fullscreen;
+    }
+  }
+
   bars_render_visualizer();
   EndDrawing();
 }

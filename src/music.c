@@ -59,7 +59,6 @@ int main(void) {
   SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_UNDECORATED);
   InitWindow(factor * 16, factor * 9, "Music Visualizer");
 
-  SetTargetFPS(60);
   InitAudioDevice();
   SetExitKey(0);
 
