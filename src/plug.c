@@ -1,4 +1,3 @@
-#include "plug.h"
 
 #include <assert.h>
 #include <complex.h>
@@ -11,8 +10,9 @@
 
 #include <raylib.h>
 
+#include "plug.h"
 #include "tinyfiledialogs.h"
-
+#define DURATION_BAR 2.0f // 2 seconds
 #define N (1 << 13)
 #define BARS 64
 #define FONT_SIZE 64
@@ -21,18 +21,15 @@
 #define ARRAY_LEN(xs) sizeof(xs) / sizeof(xs[0])
 
 typedef struct {
+  const char *file_name;
+  const Music music;
+} Track;
 
-  // Resoruces
-  Music music;
-  Font font;
-
-  // Control
-  bool error;
-  bool has_music;
-  bool paused;
-  bool fullscreen;
-  unsigned sample_rate;
-} Plug;
+typedef struct {
+  Track *items;
+  size_t count;
+  size_t capacity;
+} Tracks;
 
 typedef enum {
   PLAY_UI_ICON,
@@ -40,6 +37,27 @@ typedef enum {
   VOLUME_UI_ICON,
   COUNT_UI_ICONS,
 } Ui_Icon;
+
+typedef struct {
+
+  // Resoruces
+  Music music;
+  Font font;
+  Tracks tracks;
+  Track current;
+  Texture2D icons_textures[COUNT_UI_ICONS];
+  // Control
+  bool error;
+  bool has_music;
+  bool paused;
+  bool fullscreen;
+  unsigned sample_rate;
+
+  // Mouse state
+  double last_mouse_move_time;
+  bool mouse_active;
+
+} Plug;
 
 static_assert(COUNT_UI_ICONS == 3, "Amount of icons changed");
 
@@ -50,6 +68,19 @@ static float window[N];
 static float complex spectrum[N];
 static float bars[BARS];
 static bool window_ready = false;
+
+static void update_mouse_activity(void) {
+  if (!plug->fullscreen)
+    return;
+  const double MOUSE_TIMEOUT = 2.0f;
+
+  Vector2 delta = GetMouseDelta();
+  if (delta.x != 0 || delta.y != 0) {
+    plug->last_mouse_move_time = GetTime();
+  }
+
+  plug->mouse_active = (GetTime() - plug->last_mouse_move_time) < MOUSE_TIMEOUT;
+}
 
 static void fft(float in[], size_t stride, float complex out[], size_t n) {
   if (n == 1) {
@@ -92,6 +123,8 @@ void plug_init(void) {
       LoadFontEx("./resources/fonts/Alegreya-Regular.ttf", FONT_SIZE, NULL, 0);
 
   plug->fullscreen = false;
+  plug->mouse_active = false;
+  plug->last_mouse_move_time = -100.0f;
   memset(samples, 0, sizeof(samples));
   memset(bars, 0, sizeof(bars));
 }
@@ -166,20 +199,19 @@ static void bars_render_visualizer(void) {
   int w = GetRenderWidth();
   int h = GetRenderHeight();
 
-  BeginDrawing();
-  ClearBackground((Color){0x18, 0x18, 0x18, 0xFF});
-
   if (plug->has_music) {
     float cw = (float)w / BARS;
 
     for (int i = 0; i < BARS; i++) {
-      float bh = bars[i] * h * 0.9f;
-      float bh1 = bars[i] * h * 0.75f;
+
+      float bh = plug->fullscreen ? bars[i] * h * 0.9f : bars[i] * h * 0.75f;
       if (plug->fullscreen) {
-        DrawRectangle(i * cw, h - bh - h * 0.05f, cw - 2, bh, GREEN);
+        float y = plug->mouse_active ? h - bh - h * 0.05f : h - bh;
+
+        DrawRectangle(i * cw, y, cw - 2, bh, GREEN);
       } else {
-        DrawRectangle(i * cw + 0.23f * w, (h - bh1) - 150 - h * 0.05f, cw - 2,
-                      bh1, GREEN);
+        DrawRectangle(i * cw + 0.23f * w, (h - bh) - 150 - h * 0.05f, cw - 2,
+                      bh, GREEN);
       }
     }
   } else {
@@ -194,8 +226,6 @@ static void bars_render_visualizer(void) {
                (Vector2){w / 2.0f - size.x / 2, h / 2.0f - size.y / 2},
                plug->font.baseSize, 0, col);
   }
-
-  EndDrawing();
 }
 
 static void fft_render_visualizar(void) {
@@ -248,7 +278,7 @@ static void fft_render_visualizar(void) {
   }
 }
 
-static void draw_iu_icons_bar(void) {
+static void draw_ui_icons_bar(void) {
   if (!plug->has_music)
     return;
   int w = GetRenderWidth();
@@ -256,6 +286,11 @@ static void draw_iu_icons_bar(void) {
 
   Rectangle bar_background;
   if (plug->fullscreen) {
+    /*If dont move mouse dont draw ui icons bar*/
+
+    if (!plug->mouse_active)
+      return;
+
     bar_background = (Rectangle){
         .height = h * 0.05f,
         .width = w,
@@ -349,11 +384,17 @@ void plug_update(void) {
     }
   }
 
+  update_mouse_activity();
   input_visualizer();
   file_dropped_visualizer();
+
+  BeginDrawing();
+  ClearBackground((Color){0x18, 0x18, 0x18, 0xFF});
+
   fft_render_visualizar();
   draw_tracks_queue();
   draw_progress_bar();
-  draw_iu_icons_bar();
+  draw_ui_icons_bar();
   bars_render_visualizer();
+  EndDrawing();
 }

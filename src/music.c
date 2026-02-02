@@ -61,6 +61,7 @@ int main(void) {
 
   SetTargetFPS(60);
   InitAudioDevice();
+  SetExitKey(0);
 
   plug_init();
   while (!WindowShouldClose()) {
@@ -74,5 +75,7 @@ int main(void) {
     plug_update();
   }
 
+  CloseWindow();
+  CloseAudioDevice();
   return 0;
 }
