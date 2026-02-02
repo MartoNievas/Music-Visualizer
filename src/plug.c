@@ -19,6 +19,9 @@
 
 #define ARRAY_LEN(xs) sizeof(xs) / sizeof(xs[0])
 
+static double master_vol = 0.5f;
+static double volume_saved = 0.0f;
+
 typedef struct {
   const char *file_name;
   const Music music;
@@ -33,9 +36,16 @@ typedef struct {
 typedef enum {
   PLAY_UI_ICON,
   VOLUME_UI_ICON,
+  MUTE_UI_ICON,
   FULLSCREEN_UI_ICON,
   COUNT_UI_ICONS,
 } Ui_Icon;
+
+typedef struct {
+  bool visible;
+  Rectangle bounds;
+  float value; // 0.0 a 1.0
+} VolumeSlider;
 
 typedef struct {
 
@@ -51,21 +61,23 @@ typedef struct {
   bool fullscreen;
   unsigned sample_rate;
 
-  int volume_level; // 0..3
+  int volume_level; // 0..2
 
   double last_mouse_move_time;
   bool mouse_active;
 
 } Plug;
 
-static_assert(COUNT_UI_ICONS == 3, "Amount of icons changed");
+static_assert(COUNT_UI_ICONS == 4, "Amount of icons changed");
 const static char *ui_resources_icons[COUNT_UI_ICONS] = {
     [FULLSCREEN_UI_ICON] = "resources/icons/fullscreen.png",
     [PLAY_UI_ICON] = "resources/icons/play.png",
-    [VOLUME_UI_ICON] = "resources/icons/volume.png"};
+    [VOLUME_UI_ICON] = "resources/icons/volume.png",
+    [MUTE_UI_ICON] = "resources/icons/mute.png"};
 
 static Rectangle ui_recs[COUNT_UI_ICONS];
 static Plug *plug = NULL;
+static VolumeSlider volume_slider = {0};
 
 static float samples[N];
 static float window[N];
@@ -272,6 +284,66 @@ static void fft_render_visualizar(void) {
   }
 }
 
+static void draw_volume_slider(void) {
+  if (!volume_slider.visible)
+    return;
+
+  Rectangle slider = volume_slider.bounds;
+
+  // Fondo de la barra
+  DrawRectangleRec(slider, (Color){0x20, 0x20, 0x20, 0xF0});
+  DrawRectangleLinesEx(slider, 1, (Color){0x50, 0x50, 0x50, 0xFF});
+
+  // Barra de progreso (horizontal)
+  float fill_width = slider.width * volume_slider.value;
+  Rectangle fill = {slider.x, slider.y, fill_width, slider.height};
+
+  DrawRectangleRec(fill, (Color){100, 180, 255, 220});
+
+  // Indicador circular
+  float indicator_x = slider.x + fill_width;
+  float indicator_y = slider.y + slider.height * 0.5f;
+  DrawCircle(indicator_x, indicator_y, 6, WHITE);
+  DrawCircle(indicator_x, indicator_y, 4, (Color){100, 180, 255, 255});
+
+  // Texto del porcentaje (al lado derecho de la barra)
+  char percent_text[16];
+  snprintf(percent_text, sizeof(percent_text), "%d%%",
+           (int)(volume_slider.value * 100));
+  DrawText(percent_text, slider.x + slider.width + 10,
+           slider.y + (slider.height - 10) * 0.5f, 10, WHITE);
+
+  // Manejar interacción
+  Vector2 mouse = GetMousePosition();
+
+  if (CheckCollisionPointRec(mouse, slider)) {
+    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+      // Calcular nuevo volumen basado en la posición X del mouse
+      float relative_x = mouse.x - slider.x;
+      float new_value = relative_x / slider.width;
+
+      // Clamp entre 0 y 1
+      if (new_value < 0.0f)
+        new_value = 0.0f;
+      if (new_value > 1.0f)
+        new_value = 1.0f;
+
+      volume_slider.value = new_value;
+      master_vol = new_value;
+      SetMusicVolume(plug->music, master_vol);
+
+      // Actualizar nivel de volumen para el icono (frames: 0=bajo, 1=medio,
+      // 2=alto)
+      if (master_vol <= 0.05f)
+        plug->volume_level = 0;
+      else if (master_vol <= 0.65f)
+        plug->volume_level = 1;
+      else
+        plug->volume_level = 2;
+    }
+  }
+}
+
 static void draw_ui_icons_bar(void) {
   if (!plug->has_music)
     return;
@@ -324,7 +396,12 @@ static void draw_ui_icons_bar(void) {
 
   /* VOLUME */
   {
-    Texture2D tex = plug->icons_textures[VOLUME_UI_ICON];
+    Texture2D tex;
+    if (master_vol == 0.0f) {
+      tex = plug->icons_textures[MUTE_UI_ICON];
+    } else {
+      tex = plug->icons_textures[VOLUME_UI_ICON];
+    }
     float frame = plug->volume_level;
     float s = tex.height;
 
@@ -333,6 +410,28 @@ static void draw_ui_icons_bar(void) {
 
     DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0, WHITE);
     ui_recs[VOLUME_UI_ICON] = dst;
+
+    // Detectar hover sobre el icono de volumen
+    Vector2 mouse = GetMousePosition();
+
+    // Posicionar slider horizontal al lado derecho del icono
+    float slider_width = icon_size * 5.0f;  // Ancho del slider horizontal
+    float slider_height = icon_size * 0.5f; // Alto del slider
+
+    Rectangle slider_bounds =
+        (Rectangle){dst.x + dst.width + padding,
+                    dst.y + (dst.height - slider_height) * 0.5f, slider_width,
+                    slider_height};
+
+    // Mostrar slider si el mouse está sobre el icono O sobre el slider
+    if (CheckCollisionPointRec(mouse, dst) ||
+        CheckCollisionPointRec(mouse, slider_bounds)) {
+      volume_slider.visible = true;
+      volume_slider.bounds = slider_bounds;
+      volume_slider.value = master_vol;
+    } else {
+      volume_slider.visible = false;
+    }
 
     x_left += icon_size + padding;
   }
@@ -358,13 +457,36 @@ static void input_visualizer(void) {
     plug->fullscreen = !plug->fullscreen;
   }
 
-  if (IsKeyPressed(KEY_SPACE) && plug->has_music) {
-    if (plug->paused) {
-      ResumeMusicStream(plug->music);
-      plug->paused = false;
-    } else {
-      PauseMusicStream(plug->music);
-      plug->paused = true;
+  if (plug->has_music) {
+    if (IsKeyPressed(KEY_SPACE)) {
+      if (plug->paused) {
+        ResumeMusicStream(plug->music);
+        plug->paused = false;
+      } else {
+        PauseMusicStream(plug->music);
+        plug->paused = true;
+      }
+    }
+    Vector2 mouse = GetMousePosition();
+    if (IsKeyPressed(KEY_M) ||
+        (CheckCollisionPointRec(mouse, ui_recs[VOLUME_UI_ICON]) &&
+         IsMouseButtonPressed(MOUSE_BUTTON_LEFT))) {
+      if (master_vol != 0.0f) {
+        volume_saved = master_vol;
+        master_vol = 0.0f;
+      } else {
+        master_vol = volume_saved;
+      }
+      SetMusicVolume(plug->music, master_vol);
+
+      // Actualizar nivel de volumen para el icono (frames: 0=bajo, 1=medio,
+      // 2=alto)
+      if (master_vol <= 0.5f)
+        plug->volume_level = 0;
+      else if (master_vol <= 0.75f)
+        plug->volume_level = 1;
+      else
+        plug->volume_level = 2;
     }
   }
 }
@@ -389,7 +511,7 @@ static void file_dropped_visualizer(void) {
         plug->paused = false;
         plug->sample_rate = plug->music.stream.sampleRate;
         AttachAudioStreamProcessor(plug->music.stream, audio_callback);
-        SetMusicVolume(plug->music, 0.5f);
+        SetMusicVolume(plug->music, master_vol);
         PlayMusicStream(plug->music);
       } else {
         plug->error = true;
@@ -468,11 +590,13 @@ void plug_init(void) {
   plug->fullscreen = false;
   plug->mouse_active = false;
   plug->last_mouse_move_time = -100.0f;
-  plug->volume_level = 2;
+  plug->volume_level = 1; // Inicializar en nivel medio
 
   memset(samples, 0, sizeof(samples));
   memset(bars, 0, sizeof(bars));
-  SetMasterVolume(0.5f);
+  memset(&volume_slider, 0, sizeof(volume_slider));
+
+  SetMasterVolume(master_vol);
   SetTargetFPS(60);
 }
 
@@ -494,7 +618,7 @@ void plug_update(void) {
         plug->error = false;
         plug->sample_rate = music.stream.sampleRate;
         AttachAudioStreamProcessor(music.stream, audio_callback);
-        SetMusicVolume(music, 0.5f);
+        SetMusicVolume(music, master_vol);
         PlayMusicStream(music);
       } else {
         plug->error = true;
@@ -514,6 +638,7 @@ void plug_update(void) {
   draw_tracks_queue();
   draw_progress_bar();
   draw_ui_icons_bar();
+  draw_volume_slider();
 
   if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && ui_bar_active()) {
     Vector2 m = GetMousePosition();
@@ -525,14 +650,6 @@ void plug_update(void) {
         PauseMusicStream(plug->music);
       else
         ResumeMusicStream(plug->music);
-    }
-
-    else if (CheckCollisionPointRec(m, ui_recs[VOLUME_UI_ICON])) {
-      float vol = GetMasterVolume();
-      vol += 0.1f;
-      if (vol > 1.0f)
-        vol = 0.0f;
-      SetMusicVolume(plug->music, vol);
     }
 
     else if (CheckCollisionPointRec(m, ui_recs[FULLSCREEN_UI_ICON])) {
