@@ -18,7 +18,7 @@
 #include "nob.h"
 #define DURATION_BAR 2.0f
 #define N (1 << 13)
-#define BARS 128
+#define BARS 64
 #define FONT_SIZE 64
 #define PI 3.14159265358979323846f
 
@@ -241,7 +241,7 @@ static void draw_bars(void) {
       Color bar_color = ColorFromHSV(hue, saturation, value);
 
       // Dibujamos con cw - 1 para mantener la separación física entre barras
-      DrawRectangle((int)x, (int)y, (int)cw - 1, (int)bh, bar_color);
+      DrawRectangle((int)x, (int)y, (int)cw - 2, (int)bh, bar_color);
     }
   } else {
     const char *msg = plug->error
@@ -556,11 +556,12 @@ static void handle_input(void) {
 
   if (IsKeyPressed(KEY_SPACE)) {
 
-    plug->paused = !plug->paused;
     if (plug->paused)
       ResumeMusicStream(current_track()->music);
     else
       PauseMusicStream(current_track()->music);
+
+    plug->paused = !plug->paused;
   }
 
   Vector2 mouse = GetMousePosition();
