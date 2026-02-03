@@ -66,6 +66,8 @@ typedef struct {
   double last_mouse_move_time;
   bool mouse_active;
 
+  // queue
+  float queue_scroll;
 } Plug;
 
 static_assert(COUNT_UI_ICONS == 3, "Amount of icons changed");
@@ -168,11 +170,10 @@ static void draw_progress(void) {
   int h = GetRenderHeight();
 
   float x = t * w;
-  float bar_width = 6.0f;
+  float bar_width = 10.0f;
 
   DrawRectangle(0, h - 150, w, 200, BLACK);
-  DrawRectangle(x - bar_width * 0.5f, h - 150, bar_width, 200,
-                (Color){100, 180, 255, 220});
+  DrawRectangle(x - bar_width * 0.5f, h - 150, bar_width, 200, BLUE);
 
   if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
     Vector2 m = GetMousePosition();
@@ -196,18 +197,113 @@ static void draw_progress(void) {
   }
 }
 
+static void switch_track(int index) {
+  if (plug->tracks.count == 0)
+    return;
+
+  Track *prev = current_track();
+  if (prev) {
+    StopMusicStream(prev->music);
+    DetachAudioStreamProcessor(prev->music.stream, process_audio);
+  }
+
+  if (index < 0)
+    plug->current_track = plug->tracks.count - 1;
+  else if ((size_t)plug->current_track >= plug->tracks.count)
+    plug->current_track = 0;
+  else
+    plug->current_track = index;
+
+  Track *next = current_track();
+  plug->sample_rate = next->music.stream.sampleRate;
+  AttachAudioStreamProcessor(next->music.stream, process_audio);
+  SetMusicVolume(next->music, master_vol);
+  PlayMusicStream(next->music);
+
+  plug->paused = false;
+  plug->has_music = true;
+}
+
 static void draw_queue(void) {
   if (plug->fullscreen || !plug->has_music)
     return;
 
   int w = GetRenderWidth();
   int h = GetRenderHeight();
-
   float queue_width = w * 0.20f;
-  float queue_height = h - 150;
+  float queue_height = h - 150.0f;
 
-  DrawRectangle(0, 0, queue_width, queue_height,
-                (Color){0x10, 0x10, 0x10, 0xFF});
+  DrawRectangle(0, 0, (int)queue_width, (int)queue_height,
+                (Color){0x15, 0x15, 0x15, 0xFF});
+
+  float item_height = 50.0f;
+  float font_size = 24.0f;
+  float side_padding = 10.0f;
+  float inner_padding = 15.0f;
+
+  if (CheckCollisionPointRec(GetMousePosition(),
+                             (Rectangle){0, 0, queue_width, queue_height})) {
+    plug->queue_scroll += GetMouseWheelMove() * 25.0f;
+  }
+
+  float content_height = (float)plug->tracks.count * (item_height + 10.0f);
+  float max_scroll = (content_height > queue_height)
+                         ? (queue_height - content_height - 20.0f)
+                         : 0.0f;
+  if (plug->queue_scroll < max_scroll)
+    plug->queue_scroll = max_scroll;
+  if (plug->queue_scroll > 0)
+    plug->queue_scroll = 0;
+
+  for (size_t i = 0; i < plug->tracks.count; i++) {
+    float y_pos = i * (item_height + 10.0f) + plug->queue_scroll + 10.0f;
+    if (y_pos + item_height < 0 || y_pos > queue_height)
+      continue;
+
+    Rectangle item_rec = {side_padding, y_pos, queue_width - (side_padding * 2),
+                          item_height};
+    bool is_current = (i == (size_t)plug->current_track);
+    bool is_hover = CheckCollisionPointRec(GetMousePosition(), item_rec);
+
+    Color base_color = is_current ? (Color){0x3b, 0x59, 0xd8, 0xFF}
+                                  : (Color){0x25, 0x25, 0x25, 0xFF};
+    if (is_hover && !is_current)
+      base_color = (Color){0x30, 0x30, 0x30, 0xFF};
+
+    DrawRectangleRounded(item_rec, 0.2f, 8, base_color);
+
+    const char *name = GetFileName(plug->tracks.items[i].file_name);
+    Vector2 text_size = MeasureTextEx(plug->font, name, font_size, 0);
+
+    float available_space = item_rec.width - (inner_padding * 2);
+    Vector2 text_pos = {item_rec.x + inner_padding,
+                        item_rec.y + (item_rec.height / 2) - (text_size.y / 2)};
+
+    BeginScissorMode((int)item_rec.x + 5, (int)item_rec.y,
+                     (int)item_rec.width - 10, (int)item_rec.height);
+
+    if (is_hover && text_size.x > available_space) {
+      float speed = 30.0f;
+      float total_dist = text_size.x - available_space + 20.0f;
+      float time = (float)GetTime();
+
+      float offset = fmodf(time * speed, total_dist * 2);
+      if (offset > total_dist)
+        offset = total_dist * 2 - offset;
+
+      text_pos.x -= offset;
+    } else if (text_size.x <= available_space) {
+      text_pos.x = item_rec.x + (item_rec.width / 2) - (text_size.x / 2);
+    }
+
+    DrawTextEx(plug->font, name, text_pos, font_size, 0, WHITE);
+
+    EndScissorMode();
+
+    if (is_hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+      switch_track((int)i);
+    }
+  }
 }
 
 static void draw_bars(void) {
@@ -400,104 +496,84 @@ static void draw_ui_bar(void) {
   int w = GetRenderWidth();
   int h = GetRenderHeight();
 
+  float bar_height = h * 0.05f;
+  if (bar_height < 40.0f)
+    bar_height = 40.0f;
+
   Rectangle bar;
   if (plug->fullscreen) {
     if (!plug->mouse_active)
       return;
-
-    bar = (Rectangle){
-        0,
-        h - h * 0.05f,
-        w,
-        h * 0.05f,
-    };
+    bar = (Rectangle){0, h - bar_height, (float)w, bar_height};
   } else {
-    bar = (Rectangle){
-        w * 0.20f,
-        h - 150 - h * 0.05f,
-        w - w * 0.20f,
-        h * 0.05f,
-    };
+    // Ajustamos la barra para que mantenga su proporción pero respete el mínimo
+    bar = (Rectangle){w * 0.20f, h - 150.0f - bar_height, w - w * 0.20f,
+                      bar_height};
   }
 
   DrawRectangleRec(bar, (Color){0x10, 0x10, 0x10, 0xFF});
 
-  float padding = bar.height * 0.25f;
+  float padding = bar.height * 0.20f;
   float icon_size = bar.height - padding * 2;
-  float y = bar.y + (bar.height - icon_size) * 0.5f;
+  float y = bar.y + padding;
 
   float x_left = bar.x + padding;
 
   {
     Texture2D tex = plug->icons_textures[PLAY_UI_ICON];
     float frame = plug->paused ? 0 : 1;
-    float s = tex.height;
-
+    float s = (float)tex.height;
     Rectangle dst = {x_left, y, icon_size, icon_size};
     Rectangle src = {frame * s, 0, s, s};
-
     DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0, WHITE);
     ui_recs[PLAY_UI_ICON] = dst;
-
     x_left += icon_size + padding;
   }
 
   {
-    Texture2D tex;
-    tex = plug->icons_textures[VOLUME_UI_ICON];
-    float frame = plug->volume_level;
-    float s = tex.height;
-
+    Texture2D tex = plug->icons_textures[VOLUME_UI_ICON];
+    float frame = (float)plug->volume_level;
+    float s = (float)tex.height;
     Rectangle dst = {x_left, y, icon_size, icon_size};
     Rectangle src = {frame * s, 0, s, s};
-
     DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0, WHITE);
     ui_recs[VOLUME_UI_ICON] = dst;
 
     Vector2 mouse = GetMousePosition();
-
-    float slider_width = icon_size * 5.0f;
-    float slider_height = icon_size * 0.5f;
-
-    Rectangle slider_bounds =
-        (Rectangle){dst.x + dst.width + padding,
-                    dst.y + (dst.height - slider_height) * 0.5f, slider_width,
-                    slider_height};
+    float slider_width =
+        icon_size * 4.0f; // Escala el slider proporcionalmente al icono
+    float slider_height = icon_size * 0.4f;
+    Rectangle slider_bounds = {dst.x + dst.width + padding,
+                               dst.y + (dst.height - slider_height) * 0.5f,
+                               slider_width, slider_height};
 
     if (CheckCollisionPointRec(mouse, dst) ||
         CheckCollisionPointRec(mouse, slider_bounds)) {
       volume_slider.visible = true;
       volume_slider.bounds = slider_bounds;
-      volume_slider.value = master_vol;
+      volume_slider.value = (float)master_vol;
     } else {
       volume_slider.visible = false;
     }
-
     x_left += icon_size + padding;
   }
 
   {
     Texture2D tex = plug->icons_textures[FULLSCREEN_UI_ICON];
-    float s = tex.height;
-    float frame = 0;
-
+    float s = (float)tex.height;
     float x_right = bar.x + bar.width - padding - icon_size;
     Rectangle dst = {x_right, y, icon_size, icon_size};
     ui_recs[FULLSCREEN_UI_ICON] = dst;
 
     bool is_hovered = CheckCollisionPointRec(GetMousePosition(), dst);
+    float frame =
+        plug->fullscreen ? (is_hovered ? 3 : 2) : (is_hovered ? 1 : 0);
 
-    if (plug->fullscreen) {
-      frame = is_hovered ? 3 : 2;
-    } else {
-      frame = is_hovered ? 1 : 0;
-    }
     Rectangle src = {frame * s, 0, s, s};
     DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0, WHITE);
   }
 
   Vector2 mouse = GetMousePosition();
-
   if (CheckCollisionPointRec(mouse, ui_recs[PLAY_UI_ICON])) {
     tooltip(ui_recs[PLAY_UI_ICON],
             plug->paused ? "Play [SPACE]" : "Pause [SPACE]");
@@ -510,6 +586,19 @@ static void draw_ui_bar(void) {
   }
 }
 
+static void next_track_in_queue(void) {
+  if (!plug->has_music || plug->tracks.count <= 1 || plug->paused ||
+      (size_t)plug->current_track == plug->tracks.count - 1)
+    return;
+
+  float curr_time = GetMusicTimePlayed(current_track()->music);
+  float total_time = GetMusicTimeLength(current_track()->music);
+
+  if (total_time > 0.0f && curr_time >= (total_time - 0.1f)) {
+    switch_track(plug->current_track + 1);
+  }
+}
+
 static bool is_ui_bar_active(void) {
   if (!plug->has_music)
     return false;
@@ -518,33 +607,6 @@ static bool is_ui_bar_active(void) {
     return plug->mouse_active;
 
   return true;
-}
-
-static void switch_track(int index) {
-  if (plug->tracks.count == 0)
-    return;
-
-  Track *prev = current_track();
-  if (prev) {
-    StopMusicStream(prev->music);
-    DetachAudioStreamProcessor(prev->music.stream, process_audio);
-  }
-
-  if (index < 0)
-    plug->current_track = plug->tracks.count - 1;
-  else if ((size_t)plug->current_track >= plug->tracks.count)
-    plug->current_track = 0;
-  else
-    plug->current_track = index;
-
-  Track *next = current_track();
-  plug->sample_rate = next->music.stream.sampleRate;
-  AttachAudioStreamProcessor(next->music.stream, process_audio);
-  SetMusicVolume(next->music, master_vol);
-  PlayMusicStream(next->music);
-
-  plug->paused = false;
-  plug->has_music = true;
 }
 
 static void handle_input(void) {
@@ -743,7 +805,7 @@ void plug_update(void) {
   update_mouse_state();
   handle_input();
   handle_file_drop();
-
+  next_track_in_queue();
   BeginDrawing();
   ClearBackground((Color){0x18, 0x18, 0x18, 0xFF});
 
