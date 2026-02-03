@@ -215,30 +215,44 @@ static void draw_bars(void) {
   int h = GetRenderHeight();
 
   if (plug->has_music) {
-    float cw = (float)w / BARS;
+    float start_x = plug->fullscreen ? 0 : w * 0.20f;
+    float available_w = plug->fullscreen ? w : w * 0.80f;
+    float cw = available_w / BARS;
 
     for (int i = 0; i < BARS; i++) {
-      float bh = plug->fullscreen ? bars[i] * h * 0.9f : bars[i] * h * 0.75f;
-      if (plug->fullscreen) {
-        float y = plug->mouse_active ? h - bh - h * 0.05f : h - bh;
+      float intensity = bars[i];
+      if (intensity > 1.2f)
+        intensity = 1.2f;
+      if (intensity < 0.0f)
+        intensity = 0.0f;
 
-        DrawRectangle(i * cw, y, cw - 2, bh, GREEN);
-      } else {
-        DrawRectangle(i * cw + 0.20f * w, (h - bh) - 150 - h * 0.05f, cw - 2,
-                      bh, GREEN);
-      }
+      float bh = intensity * h * (plug->fullscreen ? 0.9f : 0.6f);
+      float x = start_x + i * cw;
+      float y = h - bh -
+                (plug->fullscreen ? (plug->mouse_active ? h * 0.05f : 0)
+                                  : 150 + h * 0.05f);
+
+      float hue = 120.0f - (intensity * 20.0f);
+      float saturation = 0.8f;
+      float value = 0.4f + (intensity * 0.6f);
+      if (value > 1.0f)
+        value = 1.0f;
+
+      Color bar_color = ColorFromHSV(hue, saturation, value);
+
+      // Dibujamos con cw - 1 para mantener la separación física entre barras
+      DrawRectangle((int)x, (int)y, (int)cw - 1, (int)bh, bar_color);
     }
   } else {
     const char *msg = plug->error
                           ? "Could not load file"
                           : " Select File On Click\n (Or Just Drop Here)";
-
     Color col = plug->error ? RED : WHITE;
-    Vector2 size = MeasureTextEx(plug->font, msg, plug->font.baseSize, 0);
-
+    Vector2 size =
+        MeasureTextEx(plug->font, msg, (float)plug->font.baseSize, 0);
     DrawTextEx(plug->font, msg,
                (Vector2){w / 2.0f - size.x / 2, h / 2.0f - size.y / 2},
-               plug->font.baseSize, 0, col);
+               (float)plug->font.baseSize, 0, col);
   }
 }
 
@@ -277,6 +291,7 @@ static void update_visualizer(void) {
 
       size_t k0 = (size_t)(f0 * N / plug->sample_rate);
       size_t k1 = (size_t)(f1 * N / plug->sample_rate);
+
       if (k1 <= k0)
         k1 = k0 + 1;
 
@@ -286,8 +301,13 @@ static void update_visualizer(void) {
       }
       a /= (k1 - k0);
 
-      float target = a / max_amp;
-      bars[i] += 0.2f * (target - bars[i]);
+      float target = (a / max_amp) * (1.0f + powf(t0, 2.0f) * 2.0f);
+
+      if (target > bars[i]) {
+        bars[i] += 0.3f * (target - bars[i]);
+      } else {
+        bars[i] += 0.15f * (target - bars[i]);
+      }
     }
   }
 }
@@ -334,7 +354,7 @@ static void draw_volume_slider(void) {
       SetMusicVolume(current_track()->music, master_vol);
 
       // Actualizar nivel de volumen basado en el nuevo valor
-      if (master_vol <= 0.05f)
+      if (master_vol <= 0.01f)
         plug->volume_level = 0;
       else if (master_vol <= 0.65f)
         plug->volume_level = 1;
@@ -342,6 +362,35 @@ static void draw_volume_slider(void) {
         plug->volume_level = 2;
     }
   }
+}
+
+static void tooltip(Rectangle boundary, const char *label) {
+  float font_size = 30.0f;
+  Vector2 text_size = MeasureTextEx(plug->font, label, font_size, 0);
+  Vector2 pos;
+
+  pos.x = boundary.x + (boundary.width / 2) - (text_size.x / 2);
+  pos.y = boundary.y - text_size.y - 30;
+
+  if (pos.x < 10)
+    pos.x = 10;
+  if (pos.x + text_size.x > GetScreenWidth() - 10) {
+    pos.x = GetScreenWidth() - text_size.x - 10;
+  }
+
+  if (pos.y < 10) {
+    pos.y = boundary.y + boundary.height + 15;
+  }
+
+  DrawRectangleRounded(
+      (Rectangle){pos.x - 8, pos.y - 4, text_size.x + 16, text_size.y + 8},
+      0.3f, 4, BLACK);
+
+  DrawRectangleRec(
+      (Rectangle){pos.x - 8, pos.y - 4, text_size.x + 16, text_size.y + 8},
+      BLACK);
+
+  DrawTextEx(plug->font, label, pos, font_size, 0, WHITE);
 }
 
 static void draw_ui_bar(void) {
@@ -429,95 +478,125 @@ static void draw_ui_bar(void) {
 
   {
     Texture2D tex = plug->icons_textures[FULLSCREEN_UI_ICON];
-    float frame = plug->fullscreen ? 1 : 0;
     float s = tex.height;
+    float frame = 0;
 
     float x_right = bar.x + bar.width - padding - icon_size;
-
     Rectangle dst = {x_right, y, icon_size, icon_size};
-    Rectangle src = {frame * s, 0, s, s};
-
-    DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0, WHITE);
     ui_recs[FULLSCREEN_UI_ICON] = dst;
+
+    bool is_hovered = CheckCollisionPointRec(GetMousePosition(), dst);
+
+    if (plug->fullscreen) {
+      frame = is_hovered ? 3 : 2;
+    } else {
+      frame = is_hovered ? 1 : 0;
+    }
+    Rectangle src = {frame * s, 0, s, s};
+    DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0, WHITE);
+  }
+
+  Vector2 mouse = GetMousePosition();
+
+  if (CheckCollisionPointRec(mouse, ui_recs[PLAY_UI_ICON])) {
+    tooltip(ui_recs[PLAY_UI_ICON],
+            plug->paused ? "Play [SPACE]" : "Pause [SPACE]");
+  } else if (CheckCollisionPointRec(mouse, ui_recs[VOLUME_UI_ICON])) {
+    tooltip(ui_recs[VOLUME_UI_ICON],
+            plug->volume_level == 0 ? "Unmute [M]" : "Mute [M]");
+  } else if (CheckCollisionPointRec(mouse, ui_recs[FULLSCREEN_UI_ICON])) {
+    tooltip(ui_recs[FULLSCREEN_UI_ICON],
+            plug->fullscreen ? "Collapse [F]" : "Expand [F]");
   }
 }
 
+static bool is_ui_bar_active(void) {
+  if (!plug->has_music)
+    return false;
+
+  if (plug->fullscreen)
+    return plug->mouse_active;
+
+  return true;
+}
+
+static void switch_track(int index) {
+  if (plug->tracks.count == 0)
+    return;
+
+  Track *prev = current_track();
+  if (prev) {
+    StopMusicStream(prev->music);
+    DetachAudioStreamProcessor(prev->music.stream, process_audio);
+  }
+
+  if (index < 0)
+    plug->current_track = plug->tracks.count - 1;
+  else if ((size_t)plug->current_track >= plug->tracks.count)
+    plug->current_track = 0;
+  else
+    plug->current_track = index;
+
+  Track *next = current_track();
+  plug->sample_rate = next->music.stream.sampleRate;
+  AttachAudioStreamProcessor(next->music.stream, process_audio);
+  SetMusicVolume(next->music, master_vol);
+  PlayMusicStream(next->music);
+
+  plug->paused = false;
+  plug->has_music = true;
+}
+
 static void handle_input(void) {
+  if (!plug->has_music)
+    return;
   if (IsKeyPressed(KEY_F)) {
     plug->fullscreen = !plug->fullscreen;
   }
 
-  if (plug->has_music) {
-    if (IsKeyPressed(KEY_SPACE)) {
-      if (plug->paused) {
-        ResumeMusicStream(current_track()->music);
-        plug->paused = false;
-      } else {
+  if (IsKeyPressed(KEY_SPACE)) {
+
+    plug->paused = !plug->paused;
+    if (plug->paused)
+      ResumeMusicStream(current_track()->music);
+    else
+      PauseMusicStream(current_track()->music);
+  }
+
+  Vector2 mouse = GetMousePosition();
+  if (IsKeyPressed(KEY_M) ||
+      (CheckCollisionPointRec(mouse, ui_recs[VOLUME_UI_ICON]) &&
+       IsMouseButtonPressed(MOUSE_BUTTON_LEFT))) {
+    if (master_vol > 0.0f) {
+      volume_saved = master_vol;
+      master_vol = 0.0f;
+    } else {
+      master_vol = (volume_saved > 0.0f) ? volume_saved : 0.5f;
+    }
+    SetMusicVolume(current_track()->music, master_vol);
+    volume_slider.value = master_vol;
+    plug->volume_level =
+        (master_vol <= 0.01f) ? 0 : (master_vol <= 0.65f ? 1 : 2);
+  }
+
+  if (IsKeyPressed(KEY_N))
+    switch_track(plug->current_track + 1);
+  if (IsKeyPressed(KEY_P))
+    switch_track(plug->current_track - 1);
+
+  if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && is_ui_bar_active()) {
+
+    if (CheckCollisionPointRec(mouse, ui_recs[PLAY_UI_ICON])) {
+      plug->paused = !plug->paused;
+
+      if (plug->paused)
         PauseMusicStream(current_track()->music);
-        plug->paused = true;
-      }
+      else
+        ResumeMusicStream(current_track()->music);
     }
 
-    Vector2 mouse = GetMousePosition();
-    if (IsKeyPressed(KEY_M) ||
-        (CheckCollisionPointRec(mouse, ui_recs[VOLUME_UI_ICON]) &&
-         IsMouseButtonPressed(MOUSE_BUTTON_LEFT))) {
-      if (master_vol != 0.0f) {
-        volume_saved = master_vol;
-        master_vol = 0.0f;
-        plug->volume_level = 0;
-      } else {
-        master_vol = volume_saved;
-        if (master_vol <= 0.05f)
-          plug->volume_level = 0;
-        else if (master_vol <= 0.65f)
-          plug->volume_level = 1;
-        else
-          plug->volume_level = 2;
-      }
-      SetMusicVolume(current_track()->music, master_vol);
-    }
-
-    if (IsKeyPressed(KEY_N)) {
-      if (plug->tracks.count > 0) {
-        StopMusicStream(current_track()->music);
-        DetachAudioStreamProcessor(current_track()->music.stream,
-                                   process_audio);
-
-        if ((size_t)plug->current_track + 1 < plug->tracks.count) {
-          plug->current_track++;
-        } else {
-          plug->current_track = 0;
-        }
-
-        Music new_music = current_track()->music;
-        plug->sample_rate = new_music.stream.sampleRate;
-        AttachAudioStreamProcessor(new_music.stream, process_audio);
-        SetMusicVolume(new_music, master_vol);
-        PlayMusicStream(new_music);
-        plug->paused = false;
-      }
-    }
-
-    if (IsKeyPressed(KEY_P)) {
-      if (plug->tracks.count > 0) {
-        StopMusicStream(current_track()->music);
-        DetachAudioStreamProcessor(current_track()->music.stream,
-                                   process_audio);
-
-        if (plug->current_track > 0) {
-          plug->current_track--;
-        } else {
-          plug->current_track = plug->tracks.count - 1;
-        }
-
-        Music new_music = current_track()->music;
-        plug->sample_rate = new_music.stream.sampleRate;
-        AttachAudioStreamProcessor(new_music.stream, process_audio);
-        SetMusicVolume(new_music, master_vol);
-        PlayMusicStream(new_music);
-        plug->paused = false;
-      }
+    else if (CheckCollisionPointRec(mouse, ui_recs[FULLSCREEN_UI_ICON])) {
+      plug->fullscreen = !plug->fullscreen;
     }
   }
 }
@@ -610,16 +689,6 @@ Plug *plug_pre_reload(void) {
   return plug;
 }
 
-static bool is_ui_bar_active(void) {
-  if (!plug->has_music)
-    return false;
-
-  if (plug->fullscreen)
-    return plug->mouse_active;
-
-  return true;
-}
-
 void plug_init(void) {
   plug = calloc(1, sizeof(*plug));
   assert(plug);
@@ -680,31 +749,9 @@ void plug_update(void) {
   update_visualizer();
   draw_queue();
   draw_progress();
+  draw_bars();
   draw_ui_bar();
   draw_volume_slider();
 
-  if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && is_ui_bar_active()) {
-    Vector2 m = GetMousePosition();
-
-    if (CheckCollisionPointRec(m, ui_recs[PLAY_UI_ICON])) {
-      plug->paused = !plug->paused;
-
-      if (plug->paused)
-        PauseMusicStream(current_track()->music);
-      else
-        ResumeMusicStream(current_track()->music);
-    }
-
-    else if (CheckCollisionPointRec(m, ui_recs[FULLSCREEN_UI_ICON])) {
-      plug->fullscreen = !plug->fullscreen;
-    }
-  }
-
-  for (size_t i = 0; i < plug->tracks.count; i++) {
-    const char *file = plug->tracks.items[i].file_name;
-    printf("file path: %s \n", file);
-  }
-
-  draw_bars();
   EndDrawing();
 }
