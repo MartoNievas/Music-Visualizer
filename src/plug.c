@@ -8,23 +8,26 @@
 #include <string.h>
 
 #include <raylib.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "plug.h"
 #include "tinyfiledialogs.h"
+#define NOB_IMPLEMENTATION
+#define NOB_STRIP_PREFIX
+#include "nob.h"
 #define DURATION_BAR 2.0f
 #define N (1 << 13)
-#define BARS 64
+#define BARS 128
 #define FONT_SIZE 64
 #define PI 3.14159265358979323846f
-
-#define ARRAY_LEN(xs) sizeof(xs) / sizeof(xs[0])
 
 static double master_vol = 0.5f;
 static double volume_saved = 0.0f;
 
 typedef struct {
   const char *file_name;
-  const Music music;
+  Music music;
 } Track;
 
 typedef struct {
@@ -47,10 +50,9 @@ typedef struct {
 } VolumeSlider;
 
 typedef struct {
-  Music music;
   Font font;
   Tracks tracks;
-  Track current_track;
+  int current_track;
   Texture2D icons_textures[COUNT_UI_ICONS];
 
   bool error;
@@ -92,6 +94,14 @@ void *plug_load_resoruces(const char *file_path, size_t *size) {
   return data;
 }
 
+static Track *current_track(void) {
+  if (0 <= plug->current_track &&
+      (size_t)plug->current_track < plug->tracks.count) {
+    return &plug->tracks.items[plug->current_track];
+  }
+  return NULL;
+}
+
 static void update_mouse_state(void) {
   if (!plug->fullscreen)
     return;
@@ -131,7 +141,7 @@ static float get_amplitude(float complex z) {
 }
 
 static void process_audio(void *bufferData, unsigned int frames) {
-  float (*fs)[plug->music.stream.channels] = bufferData;
+  float (*fs)[current_track()->music.stream.channels] = bufferData;
 
   for (unsigned i = 0; i < frames; i++) {
     memmove(samples, samples + 1, (N - 1) * sizeof(float));
@@ -143,8 +153,8 @@ static void draw_progress(void) {
   if (!plug->has_music || plug->fullscreen)
     return;
 
-  float played = GetMusicTimePlayed(plug->music);
-  float total = GetMusicTimeLength(plug->music);
+  float played = GetMusicTimePlayed(current_track()->music);
+  float total = GetMusicTimeLength(current_track()->music);
   if (total <= 0.0f)
     return;
 
@@ -181,7 +191,7 @@ static void draw_progress(void) {
         nt = 0;
       if (nt > 1)
         nt = 1;
-      SeekMusicStream(plug->music, total * nt);
+      SeekMusicStream(current_track()->music, total * nt);
     }
   }
 }
@@ -193,7 +203,7 @@ static void draw_queue(void) {
   int w = GetRenderWidth();
   int h = GetRenderHeight();
 
-  float queue_width = w * 0.23f;
+  float queue_width = w * 0.20f;
   float queue_height = h - 150;
 
   DrawRectangle(0, 0, queue_width, queue_height,
@@ -214,7 +224,7 @@ static void draw_bars(void) {
 
         DrawRectangle(i * cw, y, cw - 2, bh, GREEN);
       } else {
-        DrawRectangle(i * cw + 0.23f * w, (h - bh) - 150 - h * 0.05f, cw - 2,
+        DrawRectangle(i * cw + 0.20f * w, (h - bh) - 150 - h * 0.05f, cw - 2,
                       bh, GREEN);
       }
     }
@@ -321,7 +331,7 @@ static void draw_volume_slider(void) {
 
       volume_slider.value = new_value;
       master_vol = new_value;
-      SetMusicVolume(plug->music, master_vol);
+      SetMusicVolume(current_track()->music, master_vol);
 
       // Actualizar nivel de volumen basado en el nuevo valor
       if (master_vol <= 0.05f)
@@ -354,9 +364,9 @@ static void draw_ui_bar(void) {
     };
   } else {
     bar = (Rectangle){
-        w * 0.23f,
+        w * 0.20f,
         h - 150 - h * 0.05f,
-        w - w * 0.23f,
+        w - w * 0.20f,
         h * 0.05f,
     };
   }
@@ -440,13 +450,14 @@ static void handle_input(void) {
   if (plug->has_music) {
     if (IsKeyPressed(KEY_SPACE)) {
       if (plug->paused) {
-        ResumeMusicStream(plug->music);
+        ResumeMusicStream(current_track()->music);
         plug->paused = false;
       } else {
-        PauseMusicStream(plug->music);
+        PauseMusicStream(current_track()->music);
         plug->paused = true;
       }
     }
+
     Vector2 mouse = GetMousePosition();
     if (IsKeyPressed(KEY_M) ||
         (CheckCollisionPointRec(mouse, ui_recs[VOLUME_UI_ICON]) &&
@@ -457,7 +468,6 @@ static void handle_input(void) {
         plug->volume_level = 0;
       } else {
         master_vol = volume_saved;
-
         if (master_vol <= 0.05f)
           plug->volume_level = 0;
         else if (master_vol <= 0.65f)
@@ -465,39 +475,90 @@ static void handle_input(void) {
         else
           plug->volume_level = 2;
       }
-      SetMusicVolume(plug->music, master_vol);
+      SetMusicVolume(current_track()->music, master_vol);
+    }
+
+    if (IsKeyPressed(KEY_N)) {
+      if (plug->tracks.count > 0) {
+        StopMusicStream(current_track()->music);
+        DetachAudioStreamProcessor(current_track()->music.stream,
+                                   process_audio);
+
+        if ((size_t)plug->current_track + 1 < plug->tracks.count) {
+          plug->current_track++;
+        } else {
+          plug->current_track = 0;
+        }
+
+        Music new_music = current_track()->music;
+        plug->sample_rate = new_music.stream.sampleRate;
+        AttachAudioStreamProcessor(new_music.stream, process_audio);
+        SetMusicVolume(new_music, master_vol);
+        PlayMusicStream(new_music);
+        plug->paused = false;
+      }
+    }
+
+    if (IsKeyPressed(KEY_P)) {
+      if (plug->tracks.count > 0) {
+        StopMusicStream(current_track()->music);
+        DetachAudioStreamProcessor(current_track()->music.stream,
+                                   process_audio);
+
+        if (plug->current_track > 0) {
+          plug->current_track--;
+        } else {
+          plug->current_track = plug->tracks.count - 1;
+        }
+
+        Music new_music = current_track()->music;
+        plug->sample_rate = new_music.stream.sampleRate;
+        AttachAudioStreamProcessor(new_music.stream, process_audio);
+        SetMusicVolume(new_music, master_vol);
+        PlayMusicStream(new_music);
+        plug->paused = false;
+      }
     }
   }
 }
 
 static void handle_file_drop(void) {
   if (IsFileDropped()) {
+
     FilePathList files = LoadDroppedFiles();
-    if (files.count > 0) {
-      const char *path = files.paths[0];
 
-      if (plug->has_music) {
-        StopMusicStream(plug->music);
-        DetachAudioStreamProcessor(plug->music.stream, process_audio);
-        UnloadMusicStream(plug->music);
-      }
+    for (size_t i = 0; i < files.count; i++) {
+      Music music = LoadMusicStream(files.paths[i]);
 
-      plug->music = LoadMusicStream(path);
-
-      if (plug->music.stream.buffer) {
-        plug->error = false;
-        plug->has_music = true;
-        plug->paused = false;
-        plug->sample_rate = plug->music.stream.sampleRate;
-        AttachAudioStreamProcessor(plug->music.stream, process_audio);
-        SetMusicVolume(plug->music, master_vol);
-        PlayMusicStream(plug->music);
-      } else {
-        plug->error = true;
-        plug->has_music = false;
+      if (IsMusicValid(music)) {
+        AttachAudioStreamProcessor(music.stream, process_audio);
+        if (plug->has_music) {
+          char *file_path = strdup(files.paths[i]);
+          assert(file_path != NULL);
+          da_append(&plug->tracks, (CLITERAL(Track){
+                                       .file_name = file_path,
+                                       .music = music,
+                                   }));
+        } else {
+          char *file_path = strdup(files.paths[i]);
+          if (file_path != NULL) {
+            da_append(&plug->tracks, (CLITERAL(Track){
+                                         .file_name = file_path,
+                                         .music = music,
+                                     }));
+          }
+          PlayMusicStream(current_track()->music);
+          ;
+          plug->has_music = true;
+        }
       }
     }
+
     UnloadDroppedFiles(files);
+    if (current_track() == NULL && plug->tracks.count > 0) {
+      plug->current_track = 0;
+      PlayMusicStream(plug->tracks.items[0].music);
+    }
   }
 }
 
@@ -535,14 +596,14 @@ static void unload_assets(void) {
 void plug_post_reload(Plug *prev) {
   plug = prev;
   if (plug->has_music) {
-    AttachAudioStreamProcessor(plug->music.stream, process_audio);
+    AttachAudioStreamProcessor(current_track()->music.stream, process_audio);
   }
   load_assets();
 }
 
 Plug *plug_pre_reload(void) {
   if (plug->has_music) {
-    DetachAudioStreamProcessor(plug->music.stream, process_audio);
+    DetachAudioStreamProcessor(current_track()->music.stream, process_audio);
   }
   unload_assets();
 
@@ -581,7 +642,7 @@ void plug_init(void) {
 
 void plug_update(void) {
   if (plug->has_music && !plug->paused) {
-    UpdateMusicStream(plug->music);
+    UpdateMusicStream(current_track()->music);
   }
 
   if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && !plug->has_music) {
@@ -591,7 +652,10 @@ void plug_update(void) {
     if (path) {
       Music music = LoadMusicStream(path);
       if (IsMusicValid(music)) {
-        plug->music = music;
+        da_append(&plug->tracks, (CLITERAL(Track){
+                                     .music = music,
+                                     .file_name = path,
+                                 }));
         plug->has_music = true;
         plug->paused = false;
         plug->error = false;
@@ -626,14 +690,19 @@ void plug_update(void) {
       plug->paused = !plug->paused;
 
       if (plug->paused)
-        PauseMusicStream(plug->music);
+        PauseMusicStream(current_track()->music);
       else
-        ResumeMusicStream(plug->music);
+        ResumeMusicStream(current_track()->music);
     }
 
     else if (CheckCollisionPointRec(m, ui_recs[FULLSCREEN_UI_ICON])) {
       plug->fullscreen = !plug->fullscreen;
     }
+  }
+
+  for (size_t i = 0; i < plug->tracks.count; i++) {
+    const char *file = plug->tracks.items[i].file_name;
+    printf("file path: %s \n", file);
   }
 
   draw_bars();
