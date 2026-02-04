@@ -7,21 +7,20 @@
  * analysis to generate frequency-based bar graphs. It supports multiple audio
  * formats, playlist management, and interactive UI controls.
  */
-
 #include <assert.h>
 #include <complex.h>
 #include <math.h>
+#include <raylib.h>
+#include <rlgl.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#include <raylib.h>
 #include <time.h>
 #include <unistd.h>
 
-#include "plug.h"
 #include "tinyfiledialogs.h"
 #define NOB_IMPLEMENTATION
 #define NOB_STRIP_PREFIX
@@ -30,13 +29,12 @@
 /* Configuration constants */
 #define DURATION_BAR 2.0f          ///< Duration for bar animation transitions
 #define N (1 << 13)                ///< FFT sample size (8192 samples)
-#define BARS 64                    ///< Number of frequency bars to display
+#define BARS 72                    ///< Number of frequency bars to display
 #define FONT_SIZE 64               ///< Base font size for UI text
 #define PI 3.14159265358979323846f ///< Pi constant for FFT calculations
 
+#define GLSL_VERSION 330
 /* Global audio settings */
-static double master_vol = 0.5f;   ///< Master volume level (0.0 to 1.0)
-static double volume_saved = 0.0f; ///< Saved volume for mute/unmute toggle
 
 /**
  * @struct Track
@@ -88,6 +86,11 @@ typedef struct {
   int current_track; ///< Index of currently playing track
   Texture2D icons_textures[COUNT_UI_ICONS]; ///< Loaded UI icon textures
 
+  // Shaders
+  Shader circle;
+  float circle_radius_location;
+  float circle_power_location;
+
   bool error;           ///< Error state flag
   bool has_music;       ///< Whether any music is loaded
   bool paused;          ///< Playback pause state
@@ -99,7 +102,14 @@ typedef struct {
   double last_mouse_move_time; ///< Timestamp of last mouse movement
   bool mouse_active;           ///< Whether mouse is recently active
 
+  float samples[N];
+  atomic_uint sample_write;
+
   float queue_scroll; ///< Queue panel scroll offset
+
+  // Volume config
+  double master_vol;   ///< Master volume level (0.0 to 1.0)
+  double volume_saved; ///< Saved volume for mute/unmute toggle
 } Plug;
 
 /* Compile-time assertion to ensure icon array matches enum */
@@ -121,7 +131,6 @@ static Plug *plug = NULL;    ///< Global plugin instance
 static VolumeSlider volume_slider = {0}; ///< Volume slider state
 
 /* Audio processing buffers */
-static float samples[N];          ///< Ring buffer of audio samples
 static float window[N];           ///< Hann window for FFT
 static float complex spectrum[N]; ///< FFT output spectrum
 static float bars[BARS];          ///< Smoothed bar heights for visualization
@@ -233,15 +242,27 @@ static float get_amplitude(float complex z) {
  * @param bufferData Interleaved audio samples from stream
  * @param frames Number of frames in buffer
  */
-static void process_audio(void *bufferData, unsigned int frames) {
-  /* Cast to 2D array [frames][channels] */
-  float (*fs)[current_track()->music.stream.channels] = bufferData;
 
-  /* Update ring buffer with new samples (mono channel 0) */
+static void process_audio(void *bufferData, unsigned int frames) {
+
+  if (!plug)
+    return;
+
+  Track *t = current_track();
+  if (!t)
+    return;
+
+  float *fs = (float *)bufferData;
+  unsigned ch = t->music.stream.channels;
+
+  unsigned w = atomic_load_explicit(&plug->sample_write, memory_order_relaxed);
+
   for (unsigned i = 0; i < frames; i++) {
-    memmove(samples, samples + 1, (N - 1) * sizeof(float));
-    samples[N - 1] = fs[i][0];
+    plug->samples[w] = fs[i * ch]; // canal 0 (mono)
+    w = (w + 1) % N;
   }
+
+  atomic_store_explicit(&plug->sample_write, w, memory_order_release);
 }
 
 /**
@@ -321,9 +342,10 @@ static void switch_track(int index) {
   }
 
   /* Handle wraparound */
+
   if (index < 0)
     plug->current_track = plug->tracks.count - 1;
-  else if ((size_t)plug->current_track >= plug->tracks.count)
+  else if ((size_t)index >= plug->tracks.count)
     plug->current_track = 0;
   else
     plug->current_track = index;
@@ -332,7 +354,7 @@ static void switch_track(int index) {
   Track *next = current_track();
   plug->sample_rate = next->music.stream.sampleRate;
   AttachAudioStreamProcessor(next->music.stream, process_audio);
-  SetMusicVolume(next->music, master_vol);
+  SetMusicVolume(next->music, plug->master_vol);
   PlayMusicStream(next->music);
 
   plug->paused = false;
@@ -445,60 +467,137 @@ static void draw_queue(void) {
 }
 
 /**
- * @brief Renders frequency visualization bars
+ * @brief Renders frequency visualization bars with advanced effects
  *
- * Draws BARS number of frequency bins with color coding based on intensity.
- * Adapts layout for fullscreen vs windowed mode.
+ * Draws BARS with:
+ * - Smooth lines as bars
+ * - Glowing circles at tips
+ * - Smear trails for motion blur effect
+ * - Rainbow HSV coloring
  */
 static void draw_bars(void) {
   int w = GetRenderWidth();
   int h = GetRenderHeight();
 
-  if (plug->has_music) {
-    /* Calculate bar layout based on mode */
-    float start_x = plug->fullscreen ? 0 : w * 0.20f;
-    float available_w = plug->fullscreen ? w : w * 0.80f;
-    float cw = available_w / BARS;
+  if (!plug->has_music)
+    return;
 
-    for (int i = 0; i < BARS; i++) {
-      /* Clamp intensity to reasonable range */
-      float intensity = bars[i];
-      if (intensity > 1.2f)
-        intensity = 1.2f;
-      if (intensity < 0.0f)
-        intensity = 0.0f;
+  /* Calculate bar layout based on mode */
+  float start_x = plug->fullscreen ? 0 : w * 0.20f;
+  float available_w = plug->fullscreen ? w : w * 0.80f;
+  float cell_width = available_w / BARS;
+  float base_y =
+      plug->fullscreen ? (plug->mouse_active ? h * 0.95f : h) : h - 150;
 
-      /* Calculate bar height and position */
-      float bh = intensity * h * (plug->fullscreen ? 0.9f : 0.6f);
-      float x = start_x + i * cw;
-      float y = h - bh -
-                (plug->fullscreen ? (plug->mouse_active ? h * 0.05f : 0)
-                                  : 150 + h * 0.05f);
+  /* Static array for smear effect (motion blur) */
+  static float smear[BARS] = {0};
 
-      /* Map intensity to HSV color (green to yellow-green) */
-      float hue = 120.0f - (intensity * 20.0f);
-      float saturation = 0.8f;
-      float value = 0.4f + (intensity * 0.6f);
-      if (value > 1.0f)
-        value = 1.0f;
+  /* Global visual parameters */
+  float saturation = 0.75f;
+  float value = 1.0f;
 
-      Color bar_color = ColorFromHSV(hue, saturation, value);
+  /* PASS 1: Draw bar lines */
+  for (int i = 0; i < BARS; i++) {
+    float intensity = bars[i];
+    if (intensity > 1.2f)
+      intensity = 1.2f;
+    if (intensity < 0.0f)
+      intensity = 0.0f;
 
-      /* Draw bar with 2px gap between bars */
-      DrawRectangle((int)x, (int)y, (int)cw - 2, (int)bh, bar_color);
-    }
-  } else {
-    /* Display prompt when no music is loaded */
-    const char *msg = plug->error
-                          ? "Could not load file"
-                          : " Select File On Click\n (Or Just Drop Here)";
-    Color col = plug->error ? RED : WHITE;
-    Vector2 size =
-        MeasureTextEx(plug->font, msg, (float)plug->font.baseSize, 0);
-    DrawTextEx(plug->font, msg,
-               (Vector2){w / 2.0f - size.x / 2, h / 2.0f - size.y / 2},
-               (float)plug->font.baseSize, 0, col);
+    /* Update smear with slower decay */
+    float smear_speed = 3.0f;
+    smear[i] += (intensity - smear[i]) * smear_speed * GetFrameTime();
+
+    /* Calculate positions */
+    float bar_height = intensity * h * (plug->fullscreen ? 0.85f : 0.6f);
+    float x = start_x + i * cell_width + cell_width / 2;
+    float y_top = base_y - bar_height;
+
+    /* Rainbow color based on position */
+    float hue = (float)i / BARS * 360.0f;
+    Color color = ColorFromHSV(hue, saturation, value);
+
+    /* Draw line with variable thickness */
+    float thickness = cell_width / 3.0f * sqrtf(intensity);
+    Vector2 start_pos = {x, y_top};
+    Vector2 end_pos = {x, base_y};
+    DrawLineEx(start_pos, end_pos, thickness, color);
   }
+
+  /* Get default 1x1 white texture for shader effects */
+  Texture2D default_tex = {.id = rlGetTextureIdDefault(),
+                           .width = 1,
+                           .height = 1,
+                           .mipmaps = 1,
+                           .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+
+  /* PASS 2: Draw smear trails (motion blur) */
+  SetShaderValue(plug->circle, plug->circle_radius_location, (float[1]){0.3f},
+                 SHADER_UNIFORM_FLOAT);
+  SetShaderValue(plug->circle, plug->circle_power_location, (float[1]){3.0f},
+                 SHADER_UNIFORM_FLOAT);
+
+  BeginShaderMode(plug->circle);
+  for (int i = 0; i < BARS; i++) {
+    float intensity = bars[i];
+    if (intensity < 0.0f)
+      intensity = 0.0f;
+    if (intensity > 1.2f)
+      intensity = 1.2f;
+
+    float start_height = smear[i] * h * (plug->fullscreen ? 0.85f : 0.6f);
+    float end_height = intensity * h * (plug->fullscreen ? 0.85f : 0.6f);
+
+    float x = start_x + i * cell_width + cell_width / 2;
+    float y_start = base_y - start_height;
+    float y_end = base_y - end_height;
+
+    float hue = (float)i / BARS * 360.0f;
+    Color color = ColorFromHSV(hue, saturation, value);
+
+    float radius = cell_width * 1.2f * sqrtf(intensity);
+
+    /* Draw smear as stretched texture */
+    if (y_end >= y_start) {
+      Rectangle dest = {x - radius / 2, y_start, radius, y_end - y_start};
+      Rectangle src = {0, 0, 1, 0.5f};
+      DrawTexturePro(default_tex, src, dest, (Vector2){0, 0}, 0, color);
+    } else {
+      Rectangle dest = {x - radius / 2, y_end, radius, y_start - y_end};
+      Rectangle src = {0, 0.5f, 1, 0.5f};
+      DrawTexturePro(default_tex, src, dest, (Vector2){0, 0}, 0, color);
+    }
+  }
+  EndShaderMode();
+
+  /* PASS 3: Draw glowing circles at bar tips */
+  SetShaderValue(plug->circle, plug->circle_radius_location, (float[1]){0.07f},
+                 SHADER_UNIFORM_FLOAT);
+  SetShaderValue(plug->circle, plug->circle_power_location, (float[1]){5.0f},
+                 SHADER_UNIFORM_FLOAT);
+
+  BeginShaderMode(plug->circle);
+  for (int i = 0; i < BARS; i++) {
+    float intensity = bars[i];
+    if (intensity < 0.0f)
+      intensity = 0.0f;
+    if (intensity > 1.2f)
+      intensity = 1.2f;
+
+    float bar_height = intensity * h * (plug->fullscreen ? 0.85f : 0.6f);
+    float x = start_x + i * cell_width + cell_width / 2;
+    float y = base_y - bar_height;
+
+    float hue = (float)i / BARS * 360.0f;
+    Color color = ColorFromHSV(hue, saturation, value);
+
+    /* Circle size based on intensity */
+    float radius = cell_width * 0.8f * sqrtf(intensity);
+
+    Vector2 position = {x - radius, y - radius};
+    DrawTextureEx(default_tex, position, 0, 2 * radius, color);
+  }
+  EndShaderMode();
 }
 
 /**
@@ -508,7 +607,7 @@ static void draw_bars(void) {
  * 1. Apply Hann window to samples
  * 2. Compute FFT to get frequency spectrum
  * 3. Map spectrum to logarithmic frequency bins
- * 4. Smooth bar heights with temporal filtering
+ * 4. Apply enhanced bass boost and smoothing
  */
 static void update_visualizer(void) {
   if (plug->has_music && !plug->paused) {
@@ -522,8 +621,12 @@ static void update_visualizer(void) {
 
     /* Apply window function to reduce spectral leakage */
     float tmp[N];
+    unsigned w =
+        atomic_load_explicit(&plug->sample_write, memory_order_acquire);
+
     for (size_t i = 0; i < N; i++) {
-      tmp[i] = samples[i] * window[i];
+      size_t idx = (w + i) % N;
+      tmp[i] = plug->samples[idx] * window[i];
     }
 
     /* Compute frequency spectrum */
@@ -541,6 +644,11 @@ static void update_visualizer(void) {
     float freq_min = 20.0f;
     float freq_max = plug->sample_rate * 0.5f;
 
+    /* Enhanced bass boost parameters */
+    static float bass_history = 0.0f;
+    float current_bass_energy = 0.0f;
+    int bass_bands = 8; // Number of bands considered as bass (first 8)
+
     /* Map spectrum to logarithmic frequency bars */
     for (int i = 0; i < BARS; i++) {
       /* Calculate frequency range for this bar (log scale) */
@@ -557,22 +665,67 @@ static void update_visualizer(void) {
       if (k1 <= k0)
         k1 = k0 + 1;
 
-      /* Average amplitude across frequency range */
-      float a = 0.0f;
+      /* Enhanced: Find maximum amplitude in band (not average) for better
+       * response */
+      float band_max = 0.0f;
       for (size_t k = k0; k < k1 && k < N / 2; k++) {
-        a += get_amplitude(spectrum[k]);
+        float a = get_amplitude(spectrum[k]);
+        if (a > band_max)
+          band_max = a;
       }
-      a /= (k1 - k0);
 
-      /* Normalize and apply bass boost (lower frequencies get amplified) */
-      float target = (a / max_amp) * (1.0f + powf(t0, 2.0f) * 2.0f);
+      /* Normalize */
+      float normalized = band_max / max_amp;
 
-      /* Smooth bar height with different attack/release rates */
+      /* ENHANCED BASS BOOST: Stronger and more dynamic */
+      float bass_boost = 1.0f;
+      if (i < bass_bands) {
+        // Stronger boost for lower frequencies
+        float bass_factor =
+            1.0f - ((float)i /
+                    bass_bands); // 1.0 for lowest, 0.0 for highest bass band
+        bass_boost = 1.0f + bass_factor *
+                                3.5f; // Up to 4.5x boost for lowest frequencies
+
+        // Track bass energy for dynamic response
+        current_bass_energy += normalized;
+      }
+      float target = normalized * bass_boost;
+
+      /* Apply compression for better dynamic range */
+      target = sqrtf(target); // Square root compression
+
+      /* Dynamic scaling based on overall volume */
+      static float overall_level = 0.5f;
+      overall_level = 0.95f * overall_level + 0.05f * normalized;
+      target *= (1.0f + overall_level * 0.5f); // Scale up when music is louder
+
+      if (target > 1.5f)
+        target = 1.5f;
+
+      /* Update bass history for dynamic response */
+      if (i == 0) { // Use first band as bass indicator
+        bass_history = 0.9f * bass_history + 0.1f * target;
+      }
+
+      /* INERCIA: Interpolacion dependiente del tiempo */
+      float dt = GetFrameTime();
+
+      // Adaptive smoothing: faster when bass is strong
+      float smoothness_up = 20.0f + bass_history * 10.0f; // 20-30
+      float smoothness_down = 4.5f + bass_history * 2.0f; // 4.5-6.5
+
       if (target > bars[i]) {
-        bars[i] += 0.3f * (target - bars[i]); // Fast attack
+        bars[i] += (target - bars[i]) * smoothness_up * dt;
       } else {
-        bars[i] += 0.15f * (target - bars[i]); // Slower release
+        bars[i] += (target - bars[i]) * smoothness_down * dt;
       }
+
+      /* Clamp final */
+      if (bars[i] < 0.0f)
+        bars[i] = 0.0f;
+      if (bars[i] > 1.5f) // Slightly higher limit for boosted bass
+        bars[i] = 1.5f;
     }
   }
 }
@@ -627,13 +780,13 @@ static void draw_volume_slider(void) {
         new_value = 1.0f;
 
       volume_slider.value = new_value;
-      master_vol = new_value;
-      SetMusicVolume(current_track()->music, master_vol);
+      plug->master_vol = new_value;
+      SetMusicVolume(current_track()->music, plug->master_vol);
 
       /* Update volume level icon */
-      if (master_vol <= 0.01f)
+      if (plug->master_vol <= 0.01f)
         plug->volume_level = 0;
-      else if (master_vol <= 0.65f)
+      else if (plug->master_vol <= 0.65f)
         plug->volume_level = 1;
       else
         plug->volume_level = 2;
@@ -754,7 +907,7 @@ static void draw_ui_bar(void) {
         CheckCollisionPointRec(mouse, slider_bounds)) {
       volume_slider.visible = true;
       volume_slider.bounds = slider_bounds;
-      volume_slider.value = (float)master_vol;
+      volume_slider.value = (float)plug->master_vol;
     } else {
       volume_slider.visible = false;
     }
@@ -863,16 +1016,17 @@ static void handle_input(void) {
   if (IsKeyPressed(KEY_M) ||
       (CheckCollisionPointRec(mouse, ui_recs[VOLUME_UI_ICON]) &&
        IsMouseButtonPressed(MOUSE_BUTTON_LEFT))) {
-    if (master_vol > 0.0f) {
-      volume_saved = master_vol;
-      master_vol = 0.0f;
+    if (plug->master_vol > 0.0f) {
+      plug->volume_saved = plug->master_vol;
+      plug->master_vol = 0.0f;
     } else {
-      master_vol = (volume_saved > 0.0f) ? volume_saved : 0.5f;
+      plug->master_vol =
+          (plug->volume_saved > 0.0f) ? plug->volume_saved : 0.5f;
     }
-    SetMusicVolume(current_track()->music, master_vol);
-    volume_slider.value = master_vol;
+    SetMusicVolume(current_track()->music, plug->master_vol);
+    volume_slider.value = plug->master_vol;
     plug->volume_level =
-        (master_vol <= 0.01f) ? 0 : (master_vol <= 0.65f ? 1 : 2);
+        (plug->master_vol <= 0.01f) ? 0 : (plug->master_vol <= 0.65f ? 1 : 2);
   }
 
   /* Next/previous track navigation */
@@ -905,48 +1059,38 @@ static void handle_input(void) {
  * Accepts dropped audio files and adds them to the playlist.
  * Automatically starts playback if no music was loaded.
  */
+
 static void handle_file_drop(void) {
-  if (IsFileDropped()) {
+  if (!IsFileDropped())
+    return;
 
-    FilePathList files = LoadDroppedFiles();
+  FilePathList files = LoadDroppedFiles();
 
-    for (size_t i = 0; i < files.count; i++) {
-      Music music = LoadMusicStream(files.paths[i]);
+  for (size_t i = 0; i < files.count; i++) {
+    Music music = LoadMusicStream(files.paths[i]);
+    if (!IsMusicValid(music))
+      continue;
 
-      if (IsMusicValid(music)) {
-        AttachAudioStreamProcessor(music.stream, process_audio);
+    char *file_path = strdup(files.paths[i]);
+    assert(file_path);
 
-        if (plug->has_music) {
-          /* Add to existing playlist */
-          char *file_path = strdup(files.paths[i]);
-          assert(file_path != NULL);
-          da_append(&plug->tracks, (CLITERAL(Track){
-                                       .file_name = file_path,
-                                       .music = music,
-                                   }));
-        } else {
-          /* First track - start playback */
-          char *file_path = strdup(files.paths[i]);
-          if (file_path != NULL) {
-            da_append(&plug->tracks, (CLITERAL(Track){
-                                         .file_name = file_path,
-                                         .music = music,
-                                     }));
-          }
-          PlayMusicStream(current_track()->music);
-          ;
-          plug->has_music = true;
-        }
-      }
-    }
+    da_append(&plug->tracks, (CLITERAL(Track){
+                                 .file_name = file_path,
+                                 .music = music,
+                             }));
+  }
 
-    UnloadDroppedFiles(files);
+  UnloadDroppedFiles(files);
 
-    /* Ensure current track is valid */
-    if (current_track() == NULL && plug->tracks.count > 0) {
-      plug->current_track = 0;
-      PlayMusicStream(plug->tracks.items[0].music);
-    }
+  if (!plug->has_music && plug->tracks.count > 0) {
+    plug->current_track = 0;
+    plug->has_music = true;
+    plug->paused = false;
+
+    memset(plug->samples, 0, sizeof(plug->samples));
+    atomic_store(&plug->sample_write, 0);
+
+    switch_track(0);
   }
 }
 
@@ -965,7 +1109,15 @@ static void load_assets(void) {
   data = plug_load_resoruces(alegreya_path, &data_size);
   plug->font = LoadFontFromMemory(GetFileExtension(alegreya_path), data,
                                   data_size, FONT_SIZE, NULL, 0);
+  GenTextureMipmaps(&plug->font.texture);
+  SetTextureFilter(plug->font.texture, TEXTURE_FILTER_BILINEAR);
+  plug_free_resource(data);
 
+  /*Load main UI shader*/
+  data = plug_load_resoruces(
+      TextFormat("./resources/shaders/glsl%d/circle.fs", GLSL_VERSION),
+      &data_size);
+  plug->circle = LoadShaderFromMemory(NULL, data);
   plug_free_resource(data);
 
   /* Load UI icon textures */
@@ -983,12 +1135,68 @@ static void load_assets(void) {
 }
 
 /**
+  @brief open a tiny dialogs for insert a music file
+ */
+static void handle_tiny_dialogs_open(void) {
+  int w = GetRenderWidth();
+  int h = GetRenderHeight();
+
+  if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && !plug->has_music) {
+
+    char const *filters[] = {"*.wav", "*.ogg", "*.mp3", "*.flac"};
+    char const *path = tinyfd_openFileDialog(
+        "Select music", "./", ARRAY_LEN(filters), filters, "music", 0);
+
+    if (!path)
+      return;
+
+    Music music = LoadMusicStream(path);
+    if (!IsMusicValid(music)) {
+      plug->error = true;
+      return;
+    }
+
+    char *copy = strdup(path);
+    assert(copy);
+
+    da_append(&plug->tracks, (CLITERAL(Track){
+                                 .file_name = copy,
+                                 .music = music,
+                             }));
+
+    plug->has_music = true;
+    plug->paused = false;
+    plug->error = false;
+
+    memset(plug->samples, 0, sizeof(plug->samples));
+    atomic_store(&plug->sample_write, 0);
+
+    switch_track(0);
+  } else if (!plug->has_music) {
+    const char *msg = plug->error
+                          ? "Could not load file"
+                          : " Select File On Click\n (Or Just Drop Here)";
+
+    Color col = plug->error ? RED : WHITE;
+    Vector2 size =
+        MeasureTextEx(plug->font, msg, (float)plug->font.baseSize, 0);
+
+    DrawTextEx(plug->font, msg,
+               (Vector2){w / 2.0f - size.x / 2, h / 2.0f - size.y / 2},
+               (float)plug->font.baseSize, 0, col);
+  }
+}
+
+/**
  * @brief Unloads all assets from memory
  *
  * Frees font and texture resources. Called before hot reload.
  */
+
 static void unload_assets(void) {
   UnloadFont(plug->font);
+  UnloadShader(plug->circle);
+
   for (Ui_Icon icon = 0; icon < COUNT_UI_ICONS; icon++) {
     UnloadTexture(plug->icons_textures[icon]);
   }
@@ -1041,13 +1249,15 @@ void plug_init(void) {
   plug->mouse_active = false;
   plug->last_mouse_move_time = -100.0f;
   plug->volume_level = 1;
-
+  plug->sample_write = 0;
+  plug->master_vol = 0.5f;
+  plug->volume_saved = 0;
   /* Initialize audio processing buffers */
-  memset(samples, 0, sizeof(samples));
+  memset(plug->samples, 0, sizeof(plug->samples));
   memset(bars, 0, sizeof(bars));
   memset(&volume_slider, 0, sizeof(volume_slider));
 
-  SetMasterVolume(master_vol);
+  SetMasterVolume(plug->master_vol);
   SetTargetFPS(60);
 }
 
@@ -1067,33 +1277,8 @@ void plug_update(void) {
     UpdateMusicStream(current_track()->music);
   }
 
-  /* Show file dialog on click when no music loaded */
-  if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && !plug->has_music) {
-    char const *filters[] = {"*.wav", "*.ogg", "*.mp3", "*.flac"};
-    char const *path = tinyfd_openFileDialog(
-        "Select music", "./", ARRAY_LEN(filters), filters, "music", 0);
-    if (path) {
-      Music music = LoadMusicStream(path);
-      if (IsMusicValid(music)) {
-        da_append(&plug->tracks, (CLITERAL(Track){
-                                     .music = music,
-                                     .file_name = path,
-                                 }));
-        plug->has_music = true;
-        plug->paused = false;
-        plug->error = false;
-        plug->sample_rate = music.stream.sampleRate;
-        AttachAudioStreamProcessor(music.stream, process_audio);
-        SetMusicVolume(music, master_vol);
-        PlayMusicStream(music);
-      } else {
-        plug->error = true;
-        plug->has_music = false;
-      }
-    }
-  }
-
   /* Process input and state updates */
+  handle_tiny_dialogs_open();
   update_mouse_state();
   handle_input();
   handle_file_drop();
@@ -1105,6 +1290,7 @@ void plug_update(void) {
 
   update_visualizer();
   draw_queue();
+
   draw_progress();
   draw_bars();
   draw_ui_bar();
