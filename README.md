@@ -15,7 +15,7 @@ A music visualizer application built with Raylib that provides real-time audio v
 ### Building the Application
 
 ```bash
-$ ./build.sh
+$ make  
 $ ./build/music
 ```
 
@@ -26,7 +26,7 @@ For development with hot reloading enabled:
 ```bash
 $ export HOTRELOAD=1
 $ export LD_LIBRARY_PATH="./build/:$LD_LIBRARY_PATH"
-$ ./build.sh
+$ make 
 $ ./build/musualizer
 ```
 

@@ -32,7 +32,7 @@ int main() {
   printf("This is a fft test\n");
   float in[8];
   for (int n = 0; n < 8; n++) {
-    in[n] = sinf(2.0f * M_PI * 8.0f * n / 8.0f);
+    in[n] = sinf(2.0f * pi * 8.0f * n / 8.0f);
   }
 
   float complex out[8];

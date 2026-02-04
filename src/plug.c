@@ -24,7 +24,7 @@
 #include "tinyfiledialogs.h"
 #define NOB_IMPLEMENTATION
 #define NOB_STRIP_PREFIX
-#include "nob.h"
+#include "../thirdparty/nob.h"
 
 /* Configuration constants */
 #define DURATION_BAR 2.0f          ///< Duration for bar animation transitions
@@ -1251,10 +1251,11 @@ static void draw_internal_browser(void) {
     bool is_music =
         IsFileExtension(path, ".mp3") || IsFileExtension(path, ".wav") ||
         IsFileExtension(path, ".ogg") || IsFileExtension(path, ".flac");
-
     if (!is_dir && !is_music)
       continue;
-
+    const char *file_name = GetFileName(path);
+    if (file_name[0] == '.' && strcmp(file_name, "..") != 0)
+      continue;
     Rectangle item_r = {browser_rec.x + 10,
                         browser_rec.y + 60 + (render_i * item_h) +
                             plug->browser_scroll,
@@ -1319,24 +1320,48 @@ static void handle_file_inputs(void) {
 }
 
 /**
- * @brief Handles UI interactions and hotkeys for opening the file dialog.
+ * @brief Handles the external file dialog using tinyfiledialogs.
+ * Opens by default in the user's Music folder.
  */
 static void handle_tiny_dialogs_open(void) {
   int w = GetRenderWidth();
   int h = GetRenderHeight();
   const char *filters[] = {"*.wav", "*.ogg", "*.mp3", "*.flac"};
+  const char *path = NULL;
 
   // Logic for first-time load (empty state)
   if (!plug->has_music) {
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-      const char *path = tinyfd_openFileDialog(
-          "Select Music", "./", ARRAY_LEN(filters), filters, "Music Files", 0);
+      const char *home = getenv("HOME");
+      char default_dir[512] = "./"; // Fallback to current directory
+
+      if (home) {
+        /* * NOTE: On Arch Linux, the folder is usually 'Music' (English).
+         * Change to "Musica" only if your folder is named that way.
+         */
+        snprintf(default_dir, sizeof(default_dir), "%s/Music/", home);
+
+        // Verification: If 'Music' doesn't exist, try 'Musica'
+        if (!DirectoryExists(default_dir)) {
+          snprintf(default_dir, sizeof(default_dir), "%s/Musica/", home);
+        }
+
+        // Final fallback if neither exists
+        if (!DirectoryExists(default_dir)) {
+          snprintf(default_dir, sizeof(default_dir), "%s/", home);
+        }
+      }
+
+      path =
+          tinyfd_openFileDialog("Select Music", default_dir, ARRAY_LEN(filters),
+                                filters, "Music Files", 0);
+
       if (add_track_from_path(path)) {
         plug->has_music = true;
         switch_track(0);
       }
     } else {
-      // Draw central call-to-action message
+      /* Draw central call-to-action message */
       const char *msg = plug->error ? "Error: Could not load file"
                                     : "Click to Select File\n(Or Drag & Drop)";
       Color col = plug->error ? RED : WHITE;
