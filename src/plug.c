@@ -1,3 +1,13 @@
+/**
+ * @file plug.c
+ * @brief Music visualizer plugin with real-time FFT analysis and playback
+ * controls
+ *
+ * This plugin provides a real-time music visualization system using FFT
+ * analysis to generate frequency-based bar graphs. It supports multiple audio
+ * formats, playlist management, and interactive UI controls.
+ */
+
 #include <assert.h>
 #include <complex.h>
 #include <math.h>
@@ -16,79 +26,119 @@
 #define NOB_IMPLEMENTATION
 #define NOB_STRIP_PREFIX
 #include "nob.h"
-#define DURATION_BAR 2.0f
-#define N (1 << 13)
-#define BARS 64
-#define FONT_SIZE 64
-#define PI 3.14159265358979323846f
 
-static double master_vol = 0.5f;
-static double volume_saved = 0.0f;
+/* Configuration constants */
+#define DURATION_BAR 2.0f          ///< Duration for bar animation transitions
+#define N (1 << 13)                ///< FFT sample size (8192 samples)
+#define BARS 64                    ///< Number of frequency bars to display
+#define FONT_SIZE 64               ///< Base font size for UI text
+#define PI 3.14159265358979323846f ///< Pi constant for FFT calculations
 
+/* Global audio settings */
+static double master_vol = 0.5f;   ///< Master volume level (0.0 to 1.0)
+static double volume_saved = 0.0f; ///< Saved volume for mute/unmute toggle
+
+/**
+ * @struct Track
+ * @brief Represents a single audio track with its file path and music stream
+ */
 typedef struct {
-  const char *file_name;
-  Music music;
+  const char *file_name; ///< Path to the audio file
+  Music music;           ///< Raylib music stream handle
 } Track;
 
+/**
+ * @struct Tracks
+ * @brief Dynamic array of tracks (playlist)
+ */
 typedef struct {
-  Track *items;
-  size_t count;
-  size_t capacity;
+  Track *items;    ///< Array of track items
+  size_t count;    ///< Current number of tracks
+  size_t capacity; ///< Allocated capacity
 } Tracks;
 
+/**
+ * @enum Ui_Icon
+ * @brief Enumeration of UI icon types
+ */
 typedef enum {
-  PLAY_UI_ICON,
-  VOLUME_UI_ICON,
-  FULLSCREEN_UI_ICON,
-  COUNT_UI_ICONS,
+  PLAY_UI_ICON,       ///< Play/pause button icon
+  VOLUME_UI_ICON,     ///< Volume control icon
+  FULLSCREEN_UI_ICON, ///< Fullscreen toggle icon
+  COUNT_UI_ICONS,     ///< Total number of icon types
 } Ui_Icon;
 
+/**
+ * @struct VolumeSlider
+ * @brief Interactive volume slider widget state
+ */
 typedef struct {
-  bool visible;
-  Rectangle bounds;
-  float value;
+  bool visible;     ///< Whether the slider is currently visible
+  Rectangle bounds; ///< Slider's screen rectangle
+  float value;      ///< Current slider value (0.0 to 1.0)
 } VolumeSlider;
 
+/**
+ * @struct Plug
+ * @brief Main plugin state containing all application data
+ */
 typedef struct {
-  Font font;
-  Tracks tracks;
-  int current_track;
-  Texture2D icons_textures[COUNT_UI_ICONS];
+  Font font;         ///< Font for UI text rendering
+  Tracks tracks;     ///< Playlist of audio tracks
+  int current_track; ///< Index of currently playing track
+  Texture2D icons_textures[COUNT_UI_ICONS]; ///< Loaded UI icon textures
 
-  bool error;
-  bool has_music;
-  bool paused;
-  bool fullscreen;
-  unsigned sample_rate;
+  bool error;           ///< Error state flag
+  bool has_music;       ///< Whether any music is loaded
+  bool paused;          ///< Playback pause state
+  bool fullscreen;      ///< Fullscreen visualization mode
+  unsigned sample_rate; ///< Current track sample rate
 
-  int volume_level;
+  int volume_level; ///< Volume level indicator (0-2: muted, low, high)
 
-  double last_mouse_move_time;
-  bool mouse_active;
+  double last_mouse_move_time; ///< Timestamp of last mouse movement
+  bool mouse_active;           ///< Whether mouse is recently active
 
-  // queue
-  float queue_scroll;
+  float queue_scroll; ///< Queue panel scroll offset
 } Plug;
 
+/* Compile-time assertion to ensure icon array matches enum */
 static_assert(COUNT_UI_ICONS == 3, "Amount of icons changed");
+
+/**
+ * @brief File paths for UI icon resources
+ */
 const static char *ui_resources_icons[COUNT_UI_ICONS] = {
     [FULLSCREEN_UI_ICON] = "resources/icons/fullscreen.png",
     [PLAY_UI_ICON] = "resources/icons/play.png",
     [VOLUME_UI_ICON] = "resources/icons/volume.png",
 };
 
-static Rectangle ui_recs[COUNT_UI_ICONS];
-static Plug *plug = NULL;
-static VolumeSlider volume_slider = {0};
+/* Global state variables */
+static Rectangle
+    ui_recs[COUNT_UI_ICONS]; ///< Collision rectangles for UI buttons
+static Plug *plug = NULL;    ///< Global plugin instance
+static VolumeSlider volume_slider = {0}; ///< Volume slider state
 
-static float samples[N];
-static float window[N];
-static float complex spectrum[N];
-static float bars[BARS];
-static bool window_ready = false;
+/* Audio processing buffers */
+static float samples[N];          ///< Ring buffer of audio samples
+static float window[N];           ///< Hann window for FFT
+static float complex spectrum[N]; ///< FFT output spectrum
+static float bars[BARS];          ///< Smoothed bar heights for visualization
+static bool window_ready = false; ///< Whether Hann window is initialized
 
+/**
+ * @brief Frees resources loaded by plug_load_resources
+ * @param data Pointer to data allocated by LoadFileData
+ */
 void plug_free_resource(void *data) { UnloadFileData(data); }
 
+/**
+ * @brief Loads file data from disk into memory
+ * @param file_path Path to the file to load
+ * @param size Output parameter for file size in bytes
+ * @return Pointer to allocated file data, or NULL on failure
+ */
 void *plug_load_resoruces(const char *file_path, size_t *size) {
   int data_size;
   void *data = LoadFileData(file_path, &data_size);
@@ -96,6 +146,10 @@ void *plug_load_resoruces(const char *file_path, size_t *size) {
   return data;
 }
 
+/**
+ * @brief Gets pointer to the currently playing track
+ * @return Pointer to current Track, or NULL if no track is playing
+ */
 static Track *current_track(void) {
   if (0 <= plug->current_track &&
       (size_t)plug->current_track < plug->tracks.count) {
@@ -104,10 +158,17 @@ static Track *current_track(void) {
   return NULL;
 }
 
+/**
+ * @brief Updates mouse activity state for UI auto-hiding in fullscreen
+ *
+ * Tracks mouse movement to determine if UI should be visible in fullscreen
+ * mode. UI hides after MOUSE_TIMEOUT seconds of inactivity.
+ */
 static void update_mouse_state(void) {
   if (!plug->fullscreen)
     return;
-  const double MOUSE_TIMEOUT = 2.0f;
+
+  const double MOUSE_TIMEOUT = 2.0f; ///< Seconds of inactivity before hiding UI
 
   Vector2 delta = GetMouseDelta();
   if (delta.x != 0 || delta.y != 0) {
@@ -117,16 +178,29 @@ static void update_mouse_state(void) {
   plug->mouse_active = (GetTime() - plug->last_mouse_move_time) < MOUSE_TIMEOUT;
 }
 
+/**
+ * @brief Computes Fast Fourier Transform using Cooley-Tukey algorithm
+ *
+ * Recursive radix-2 decimation-in-time FFT implementation.
+ *
+ * @param in Input array of real samples
+ * @param stride Stride between samples (used for recursion)
+ * @param out Output array for complex frequency spectrum
+ * @param n Number of samples (must be power of 2)
+ */
 static void compute_fft(float in[], size_t stride, float complex out[],
                         size_t n) {
+  /* Base case: single sample */
   if (n == 1) {
     out[0] = in[0];
     return;
   }
 
+  /* Recursively compute FFT of even and odd samples */
   compute_fft(in, stride * 2, out, n / 2);
   compute_fft(in + stride, stride * 2, out + n / 2, n / 2);
 
+  /* Combine results using butterfly operations */
   for (size_t k = 0; k < n / 2; k++) {
     float t = (float)k / n;
     float complex v = cexpf(-2.0f * I * PI * t) * out[k + n / 2];
@@ -136,25 +210,51 @@ static void compute_fft(float in[], size_t stride, float complex out[],
   }
 }
 
+/**
+ * @brief Calculates amplitude of a complex number using infinity norm
+ *
+ * Uses max(|real|, |imag|) as a fast approximation of magnitude.
+ *
+ * @param z Complex number
+ * @return Amplitude (infinity norm)
+ */
 static float get_amplitude(float complex z) {
   float a = fabsf(crealf(z));
   float b = fabsf(cimagf(z));
   return (a > b) ? a : b;
 }
 
+/**
+ * @brief Audio stream callback that captures samples for visualization
+ *
+ * Called by Raylib for each audio buffer. Maintains a ring buffer of samples
+ * for FFT processing.
+ *
+ * @param bufferData Interleaved audio samples from stream
+ * @param frames Number of frames in buffer
+ */
 static void process_audio(void *bufferData, unsigned int frames) {
+  /* Cast to 2D array [frames][channels] */
   float (*fs)[current_track()->music.stream.channels] = bufferData;
 
+  /* Update ring buffer with new samples (mono channel 0) */
   for (unsigned i = 0; i < frames; i++) {
     memmove(samples, samples + 1, (N - 1) * sizeof(float));
     samples[N - 1] = fs[i][0];
   }
 }
 
+/**
+ * @brief Draws playback progress bar and handles seeking
+ *
+ * Displays current position in track and allows clicking to seek.
+ * Only shown in windowed mode.
+ */
 static void draw_progress(void) {
   if (!plug->has_music || plug->fullscreen)
     return;
 
+  /* Calculate progress percentage */
   float played = GetMusicTimePlayed(current_track()->music);
   float total = GetMusicTimeLength(current_track()->music);
   if (total <= 0.0f)
@@ -169,15 +269,18 @@ static void draw_progress(void) {
   int w = GetRenderWidth();
   int h = GetRenderHeight();
 
+  /* Draw progress indicator */
   float x = t * w;
   float bar_width = 10.0f;
 
   DrawRectangle(0, h - 150, w, 200, BLACK);
   DrawRectangle(x - bar_width * 0.5f, h - 150, bar_width, 200, BLUE);
 
+  /* Handle click-to-seek */
   if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
     Vector2 m = GetMousePosition();
 
+    /* Check if clicking on UI buttons (to avoid conflict) */
     bool clicking_ui_button = false;
     for (int i = 0; i < COUNT_UI_ICONS; i++) {
       if (CheckCollisionPointRec(m, ui_recs[i])) {
@@ -186,6 +289,7 @@ static void draw_progress(void) {
       }
     }
 
+    /* Perform seek if clicking on progress bar */
     if (!clicking_ui_button && m.y >= h - 150 && m.y < h) {
       float nt = m.x / (float)w;
       if (nt < 0)
@@ -197,16 +301,26 @@ static void draw_progress(void) {
   }
 }
 
+/**
+ * @brief Switches to a different track in the playlist
+ *
+ * Stops current track, updates processors, and starts new track.
+ * Handles wraparound for next/previous navigation.
+ *
+ * @param index Index of track to switch to (-1 for last, >count wraps to first)
+ */
 static void switch_track(int index) {
   if (plug->tracks.count == 0)
     return;
 
+  /* Detach audio processor from previous track */
   Track *prev = current_track();
   if (prev) {
     StopMusicStream(prev->music);
     DetachAudioStreamProcessor(prev->music.stream, process_audio);
   }
 
+  /* Handle wraparound */
   if (index < 0)
     plug->current_track = plug->tracks.count - 1;
   else if ((size_t)plug->current_track >= plug->tracks.count)
@@ -214,6 +328,7 @@ static void switch_track(int index) {
   else
     plug->current_track = index;
 
+  /* Setup and start new track */
   Track *next = current_track();
   plug->sample_rate = next->music.stream.sampleRate;
   AttachAudioStreamProcessor(next->music.stream, process_audio);
@@ -224,6 +339,15 @@ static void switch_track(int index) {
   plug->has_music = true;
 }
 
+/**
+ * @brief Draws the track queue panel with scrollable list
+ *
+ * Displays playlist on left side in windowed mode. Features:
+ * - Scrollable track list
+ * - Click to select track
+ * - Highlights current track
+ * - Auto-scrolling text for long names
+ */
 static void draw_queue(void) {
   if (plug->fullscreen || !plug->has_music)
     return;
@@ -233,19 +357,23 @@ static void draw_queue(void) {
   float queue_width = w * 0.20f;
   float queue_height = h - 150.0f;
 
+  /* Draw queue background */
   DrawRectangle(0, 0, (int)queue_width, (int)queue_height,
                 (Color){0x15, 0x15, 0x15, 0xFF});
 
+  /* Layout constants */
   float item_height = 50.0f;
   float font_size = 24.0f;
   float side_padding = 10.0f;
   float inner_padding = 15.0f;
 
+  /* Handle mouse wheel scrolling */
   if (CheckCollisionPointRec(GetMousePosition(),
                              (Rectangle){0, 0, queue_width, queue_height})) {
     plug->queue_scroll += GetMouseWheelMove() * 25.0f;
   }
 
+  /* Clamp scroll to valid range */
   float content_height = (float)plug->tracks.count * (item_height + 10.0f);
   float max_scroll = (content_height > queue_height)
                          ? (queue_height - content_height - 20.0f)
@@ -255,8 +383,11 @@ static void draw_queue(void) {
   if (plug->queue_scroll > 0)
     plug->queue_scroll = 0;
 
+  /* Render each track item */
   for (size_t i = 0; i < plug->tracks.count; i++) {
     float y_pos = i * (item_height + 10.0f) + plug->queue_scroll + 10.0f;
+
+    /* Skip offscreen items for performance */
     if (y_pos + item_height < 0 || y_pos > queue_height)
       continue;
 
@@ -265,6 +396,7 @@ static void draw_queue(void) {
     bool is_current = (i == (size_t)plug->current_track);
     bool is_hover = CheckCollisionPointRec(GetMousePosition(), item_rec);
 
+    /* Determine item background color */
     Color base_color = is_current ? (Color){0x3b, 0x59, 0xd8, 0xFF}
                                   : (Color){0x25, 0x25, 0x25, 0xFF};
     if (is_hover && !is_current)
@@ -272,6 +404,7 @@ static void draw_queue(void) {
 
     DrawRectangleRounded(item_rec, 0.2f, 8, base_color);
 
+    /* Extract filename from path */
     const char *name = GetFileName(plug->tracks.items[i].file_name);
     Vector2 text_size = MeasureTextEx(plug->font, name, font_size, 0);
 
@@ -279,20 +412,24 @@ static void draw_queue(void) {
     Vector2 text_pos = {item_rec.x + inner_padding,
                         item_rec.y + (item_rec.height / 2) - (text_size.y / 2)};
 
+    /* Enable scissor mode for text clipping */
     BeginScissorMode((int)item_rec.x + 5, (int)item_rec.y,
                      (int)item_rec.width - 10, (int)item_rec.height);
 
+    /* Animate text scrolling for long filenames on hover */
     if (is_hover && text_size.x > available_space) {
       float speed = 30.0f;
       float total_dist = text_size.x - available_space + 20.0f;
       float time = (float)GetTime();
 
+      /* Ping-pong scrolling animation */
       float offset = fmodf(time * speed, total_dist * 2);
       if (offset > total_dist)
         offset = total_dist * 2 - offset;
 
       text_pos.x -= offset;
     } else if (text_size.x <= available_space) {
+      /* Center text if it fits */
       text_pos.x = item_rec.x + (item_rec.width / 2) - (text_size.x / 2);
     }
 
@@ -300,34 +437,45 @@ static void draw_queue(void) {
 
     EndScissorMode();
 
+    /* Handle track selection on click */
     if (is_hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
       switch_track((int)i);
     }
   }
 }
 
+/**
+ * @brief Renders frequency visualization bars
+ *
+ * Draws BARS number of frequency bins with color coding based on intensity.
+ * Adapts layout for fullscreen vs windowed mode.
+ */
 static void draw_bars(void) {
   int w = GetRenderWidth();
   int h = GetRenderHeight();
 
   if (plug->has_music) {
+    /* Calculate bar layout based on mode */
     float start_x = plug->fullscreen ? 0 : w * 0.20f;
     float available_w = plug->fullscreen ? w : w * 0.80f;
     float cw = available_w / BARS;
 
     for (int i = 0; i < BARS; i++) {
+      /* Clamp intensity to reasonable range */
       float intensity = bars[i];
       if (intensity > 1.2f)
         intensity = 1.2f;
       if (intensity < 0.0f)
         intensity = 0.0f;
 
+      /* Calculate bar height and position */
       float bh = intensity * h * (plug->fullscreen ? 0.9f : 0.6f);
       float x = start_x + i * cw;
       float y = h - bh -
                 (plug->fullscreen ? (plug->mouse_active ? h * 0.05f : 0)
                                   : 150 + h * 0.05f);
 
+      /* Map intensity to HSV color (green to yellow-green) */
       float hue = 120.0f - (intensity * 20.0f);
       float saturation = 0.8f;
       float value = 0.4f + (intensity * 0.6f);
@@ -336,10 +484,11 @@ static void draw_bars(void) {
 
       Color bar_color = ColorFromHSV(hue, saturation, value);
 
-      // Dibujamos con cw - 1 para mantener la separación física entre barras
+      /* Draw bar with 2px gap between bars */
       DrawRectangle((int)x, (int)y, (int)cw - 2, (int)bh, bar_color);
     }
   } else {
+    /* Display prompt when no music is loaded */
     const char *msg = plug->error
                           ? "Could not load file"
                           : " Select File On Click\n (Or Just Drop Here)";
@@ -352,8 +501,18 @@ static void draw_bars(void) {
   }
 }
 
+/**
+ * @brief Updates visualization by computing FFT and smoothing bars
+ *
+ * Processing pipeline:
+ * 1. Apply Hann window to samples
+ * 2. Compute FFT to get frequency spectrum
+ * 3. Map spectrum to logarithmic frequency bins
+ * 4. Smooth bar heights with temporal filtering
+ */
 static void update_visualizer(void) {
   if (plug->has_music && !plug->paused) {
+    /* Initialize Hann window (once) */
     if (!window_ready) {
       for (size_t i = 0; i < N; i++) {
         window[i] = 0.5f * (1.0f - cosf(2.0f * PI * i / (N - 1)));
@@ -361,13 +520,16 @@ static void update_visualizer(void) {
       window_ready = true;
     }
 
+    /* Apply window function to reduce spectral leakage */
     float tmp[N];
     for (size_t i = 0; i < N; i++) {
       tmp[i] = samples[i] * window[i];
     }
 
+    /* Compute frequency spectrum */
     compute_fft(tmp, 1, spectrum, N);
 
+    /* Find maximum amplitude for normalization */
     float max_amp = 1e-6f;
     for (size_t i = 0; i < N / 2; i++) {
       float a = get_amplitude(spectrum[i]);
@@ -375,58 +537,75 @@ static void update_visualizer(void) {
         max_amp = a;
     }
 
+    /* Define audible frequency range */
     float freq_min = 20.0f;
     float freq_max = plug->sample_rate * 0.5f;
 
+    /* Map spectrum to logarithmic frequency bars */
     for (int i = 0; i < BARS; i++) {
+      /* Calculate frequency range for this bar (log scale) */
       float t0 = (float)i / BARS;
       float t1 = (float)(i + 1) / BARS;
 
       float f0 = freq_min * powf(freq_max / freq_min, t0);
       float f1 = freq_min * powf(freq_max / freq_min, t1);
 
+      /* Convert to spectrum bin indices */
       size_t k0 = (size_t)(f0 * N / plug->sample_rate);
       size_t k1 = (size_t)(f1 * N / plug->sample_rate);
 
       if (k1 <= k0)
         k1 = k0 + 1;
 
+      /* Average amplitude across frequency range */
       float a = 0.0f;
       for (size_t k = k0; k < k1 && k < N / 2; k++) {
         a += get_amplitude(spectrum[k]);
       }
       a /= (k1 - k0);
 
+      /* Normalize and apply bass boost (lower frequencies get amplified) */
       float target = (a / max_amp) * (1.0f + powf(t0, 2.0f) * 2.0f);
 
+      /* Smooth bar height with different attack/release rates */
       if (target > bars[i]) {
-        bars[i] += 0.3f * (target - bars[i]);
+        bars[i] += 0.3f * (target - bars[i]); // Fast attack
       } else {
-        bars[i] += 0.15f * (target - bars[i]);
+        bars[i] += 0.15f * (target - bars[i]); // Slower release
       }
     }
   }
 }
 
+/**
+ * @brief Draws interactive volume slider widget
+ *
+ * Displays horizontal slider when hovering over volume icon.
+ * Allows click-and-drag to adjust volume level.
+ */
 static void draw_volume_slider(void) {
   if (!volume_slider.visible)
     return;
 
   Rectangle slider = volume_slider.bounds;
 
+  /* Draw slider background */
   DrawRectangleRec(slider, (Color){0x20, 0x20, 0x20, 0xF0});
   DrawRectangleLinesEx(slider, 1, (Color){0x50, 0x50, 0x50, 0xFF});
 
+  /* Draw filled portion */
   float fill_width = slider.width * volume_slider.value;
   Rectangle fill = {slider.x, slider.y, fill_width, slider.height};
 
   DrawRectangleRec(fill, (Color){100, 180, 255, 220});
 
+  /* Draw circular indicator at current position */
   float indicator_x = slider.x + fill_width;
   float indicator_y = slider.y + slider.height * 0.5f;
   DrawCircle(indicator_x, indicator_y, 6, WHITE);
   DrawCircle(indicator_x, indicator_y, 4, (Color){100, 180, 255, 255});
 
+  /* Draw percentage text */
   char percent_text[16];
   snprintf(percent_text, sizeof(percent_text), "%d%%",
            (int)(volume_slider.value * 100));
@@ -435,11 +614,13 @@ static void draw_volume_slider(void) {
 
   Vector2 mouse = GetMousePosition();
 
+  /* Handle dragging to adjust volume */
   if (CheckCollisionPointRec(mouse, slider)) {
     if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
       float relative_x = mouse.x - slider.x;
       float new_value = relative_x / slider.width;
 
+      /* Clamp to valid range */
       if (new_value < 0.0f)
         new_value = 0.0f;
       if (new_value > 1.0f)
@@ -449,7 +630,7 @@ static void draw_volume_slider(void) {
       master_vol = new_value;
       SetMusicVolume(current_track()->music, master_vol);
 
-      // Actualizar nivel de volumen basado en el nuevo valor
+      /* Update volume level icon */
       if (master_vol <= 0.01f)
         plug->volume_level = 0;
       else if (master_vol <= 0.65f)
@@ -460,24 +641,34 @@ static void draw_volume_slider(void) {
   }
 }
 
+/**
+ * @brief Displays tooltip text near a UI element
+ *
+ * @param boundary Rectangle of the UI element to attach tooltip to
+ * @param label Text to display in tooltip
+ */
 static void tooltip(Rectangle boundary, const char *label) {
   float font_size = 30.0f;
   Vector2 text_size = MeasureTextEx(plug->font, label, font_size, 0);
   Vector2 pos;
 
+  /* Position tooltip centered above element */
   pos.x = boundary.x + (boundary.width / 2) - (text_size.x / 2);
   pos.y = boundary.y - text_size.y - 30;
 
+  /* Keep tooltip on screen horizontally */
   if (pos.x < 10)
     pos.x = 10;
   if (pos.x + text_size.x > GetScreenWidth() - 10) {
     pos.x = GetScreenWidth() - text_size.x - 10;
   }
 
+  /* If no space above, show below element */
   if (pos.y < 10) {
     pos.y = boundary.y + boundary.height + 15;
   }
 
+  /* Draw tooltip background and text */
   DrawRectangleRounded(
       (Rectangle){pos.x - 8, pos.y - 4, text_size.x + 16, text_size.y + 8},
       0.3f, 4, BLACK);
@@ -489,6 +680,12 @@ static void tooltip(Rectangle boundary, const char *label) {
   DrawTextEx(plug->font, label, pos, font_size, 0, WHITE);
 }
 
+/**
+ * @brief Draws UI control bar with play, volume, and fullscreen buttons
+ *
+ * Bar position and visibility adapts to fullscreen mode and mouse activity.
+ * Displays tooltips on hover for each control.
+ */
 static void draw_ui_bar(void) {
   if (!plug->has_music)
     return;
@@ -502,26 +699,29 @@ static void draw_ui_bar(void) {
 
   Rectangle bar;
   if (plug->fullscreen) {
+    /* In fullscreen, only show when mouse is active */
     if (!plug->mouse_active)
       return;
     bar = (Rectangle){0, h - bar_height, (float)w, bar_height};
   } else {
-    // Ajustamos la barra para que mantenga su proporción pero respete el mínimo
+    /* In windowed mode, show above progress bar */
     bar = (Rectangle){w * 0.20f, h - 150.0f - bar_height, w - w * 0.20f,
                       bar_height};
   }
 
   DrawRectangleRec(bar, (Color){0x10, 0x10, 0x10, 0xFF});
 
+  /* Calculate icon sizing and spacing */
   float padding = bar.height * 0.20f;
   float icon_size = bar.height - padding * 2;
   float y = bar.y + padding;
 
   float x_left = bar.x + padding;
 
+  /* Draw play/pause button */
   {
     Texture2D tex = plug->icons_textures[PLAY_UI_ICON];
-    float frame = plug->paused ? 0 : 1;
+    float frame = plug->paused ? 0 : 1; // Select sprite frame
     float s = (float)tex.height;
     Rectangle dst = {x_left, y, icon_size, icon_size};
     Rectangle src = {frame * s, 0, s, s};
@@ -530,9 +730,10 @@ static void draw_ui_bar(void) {
     x_left += icon_size + padding;
   }
 
+  /* Draw volume button with slider */
   {
     Texture2D tex = plug->icons_textures[VOLUME_UI_ICON];
-    float frame = (float)plug->volume_level;
+    float frame = (float)plug->volume_level; // 0=muted, 1=low, 2=high
     float s = (float)tex.height;
     Rectangle dst = {x_left, y, icon_size, icon_size};
     Rectangle src = {frame * s, 0, s, s};
@@ -540,13 +741,15 @@ static void draw_ui_bar(void) {
     ui_recs[VOLUME_UI_ICON] = dst;
 
     Vector2 mouse = GetMousePosition();
-    float slider_width =
-        icon_size * 4.0f; // Escala el slider proporcionalmente al icono
+
+    /* Position slider next to volume icon */
+    float slider_width = icon_size * 4.0f;
     float slider_height = icon_size * 0.4f;
     Rectangle slider_bounds = {dst.x + dst.width + padding,
                                dst.y + (dst.height - slider_height) * 0.5f,
                                slider_width, slider_height};
 
+    /* Show slider when hovering over icon or slider itself */
     if (CheckCollisionPointRec(mouse, dst) ||
         CheckCollisionPointRec(mouse, slider_bounds)) {
       volume_slider.visible = true;
@@ -558,6 +761,7 @@ static void draw_ui_bar(void) {
     x_left += icon_size + padding;
   }
 
+  /* Draw fullscreen toggle button (right-aligned) */
   {
     Texture2D tex = plug->icons_textures[FULLSCREEN_UI_ICON];
     float s = (float)tex.height;
@@ -566,6 +770,8 @@ static void draw_ui_bar(void) {
     ui_recs[FULLSCREEN_UI_ICON] = dst;
 
     bool is_hovered = CheckCollisionPointRec(GetMousePosition(), dst);
+    /* Select sprite: 0=windowed, 1=windowed+hover, 2=fullscreen,
+     * 3=fullscreen+hover */
     float frame =
         plug->fullscreen ? (is_hovered ? 3 : 2) : (is_hovered ? 1 : 0);
 
@@ -573,6 +779,7 @@ static void draw_ui_bar(void) {
     DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0, WHITE);
   }
 
+  /* Draw tooltips on hover */
   Vector2 mouse = GetMousePosition();
   if (CheckCollisionPointRec(mouse, ui_recs[PLAY_UI_ICON])) {
     tooltip(ui_recs[PLAY_UI_ICON],
@@ -586,6 +793,12 @@ static void draw_ui_bar(void) {
   }
 }
 
+/**
+ * @brief Automatically advances to next track when current track finishes
+ *
+ * Checks if playback is near end of track and switches to next track in queue.
+ * Only operates when music is playing and not at end of playlist.
+ */
 static void next_track_in_queue(void) {
   if (!plug->has_music || plug->tracks.count <= 1 || plug->paused ||
       (size_t)plug->current_track == plug->tracks.count - 1)
@@ -594,11 +807,17 @@ static void next_track_in_queue(void) {
   float curr_time = GetMusicTimePlayed(current_track()->music);
   float total_time = GetMusicTimeLength(current_track()->music);
 
+  /* Switch when within 0.1s of end */
   if (total_time > 0.0f && curr_time >= (total_time - 0.1f)) {
     switch_track(plug->current_track + 1);
   }
 }
 
+/**
+ * @brief Checks if UI control bar should be visible
+ *
+ * @return true if UI bar should be drawn
+ */
 static bool is_ui_bar_active(void) {
   if (!plug->has_music)
     return false;
@@ -609,13 +828,26 @@ static bool is_ui_bar_active(void) {
   return true;
 }
 
+/**
+ * @brief Handles keyboard and mouse input for playback controls
+ *
+ * Keyboard shortcuts:
+ * - F: Toggle fullscreen
+ * - SPACE: Play/pause
+ * - M: Mute/unmute
+ * - N: Next track
+ * - P: Previous track
+ */
 static void handle_input(void) {
   if (!plug->has_music)
     return;
+
+  /* Toggle fullscreen mode */
   if (IsKeyPressed(KEY_F)) {
     plug->fullscreen = !plug->fullscreen;
   }
 
+  /* Toggle play/pause */
   if (IsKeyPressed(KEY_SPACE)) {
 
     if (plug->paused)
@@ -626,6 +858,7 @@ static void handle_input(void) {
     plug->paused = !plug->paused;
   }
 
+  /* Toggle mute (keyboard or click on volume icon) */
   Vector2 mouse = GetMousePosition();
   if (IsKeyPressed(KEY_M) ||
       (CheckCollisionPointRec(mouse, ui_recs[VOLUME_UI_ICON]) &&
@@ -642,11 +875,13 @@ static void handle_input(void) {
         (master_vol <= 0.01f) ? 0 : (master_vol <= 0.65f ? 1 : 2);
   }
 
+  /* Next/previous track navigation */
   if (IsKeyPressed(KEY_N))
     switch_track(plug->current_track + 1);
   if (IsKeyPressed(KEY_P))
     switch_track(plug->current_track - 1);
 
+  /* Handle UI button clicks */
   if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && is_ui_bar_active()) {
 
     if (CheckCollisionPointRec(mouse, ui_recs[PLAY_UI_ICON])) {
@@ -664,6 +899,12 @@ static void handle_input(void) {
   }
 }
 
+/**
+ * @brief Handles drag-and-drop file loading
+ *
+ * Accepts dropped audio files and adds them to the playlist.
+ * Automatically starts playback if no music was loaded.
+ */
 static void handle_file_drop(void) {
   if (IsFileDropped()) {
 
@@ -674,7 +915,9 @@ static void handle_file_drop(void) {
 
       if (IsMusicValid(music)) {
         AttachAudioStreamProcessor(music.stream, process_audio);
+
         if (plug->has_music) {
+          /* Add to existing playlist */
           char *file_path = strdup(files.paths[i]);
           assert(file_path != NULL);
           da_append(&plug->tracks, (CLITERAL(Track){
@@ -682,6 +925,7 @@ static void handle_file_drop(void) {
                                        .music = music,
                                    }));
         } else {
+          /* First track - start playback */
           char *file_path = strdup(files.paths[i]);
           if (file_path != NULL) {
             da_append(&plug->tracks, (CLITERAL(Track){
@@ -697,6 +941,8 @@ static void handle_file_drop(void) {
     }
 
     UnloadDroppedFiles(files);
+
+    /* Ensure current track is valid */
     if (current_track() == NULL && plug->tracks.count > 0) {
       plug->current_track = 0;
       PlayMusicStream(plug->tracks.items[0].music);
@@ -704,10 +950,17 @@ static void handle_file_drop(void) {
   }
 }
 
+/**
+ * @brief Loads all required assets (fonts and textures)
+ *
+ * Loads font and UI icon textures from disk into memory.
+ * Sets up texture filtering for smooth scaling.
+ */
 static void load_assets(void) {
   size_t data_size = 0;
   void *data = NULL;
 
+  /* Load main UI font */
   const char *alegreya_path = "resources/fonts/Alegreya-Regular.ttf";
   data = plug_load_resoruces(alegreya_path, &data_size);
   plug->font = LoadFontFromMemory(GetFileExtension(alegreya_path), data,
@@ -715,6 +968,7 @@ static void load_assets(void) {
 
   plug_free_resource(data);
 
+  /* Load UI icon textures */
   for (Ui_Icon i = 0; i < COUNT_UI_ICONS; i++) {
     data = plug_load_resoruces(ui_resources_icons[i], &data_size);
     Image image = LoadImageFromMemory(GetFileExtension(ui_resources_icons[i]),
@@ -728,6 +982,11 @@ static void load_assets(void) {
   }
 }
 
+/**
+ * @brief Unloads all assets from memory
+ *
+ * Frees font and texture resources. Called before hot reload.
+ */
 static void unload_assets(void) {
   UnloadFont(plug->font);
   for (Ui_Icon icon = 0; icon < COUNT_UI_ICONS; icon++) {
@@ -735,6 +994,11 @@ static void unload_assets(void) {
   }
 }
 
+/**
+ * @brief Hot reload callback - restores state after code reload
+ *
+ * @param prev Pointer to plugin state from before reload
+ */
 void plug_post_reload(Plug *prev) {
   plug = prev;
   if (plug->has_music) {
@@ -743,6 +1007,11 @@ void plug_post_reload(Plug *prev) {
   load_assets();
 }
 
+/**
+ * @brief Hot reload callback - saves state before code reload
+ *
+ * @return Pointer to plugin state to preserve
+ */
 Plug *plug_pre_reload(void) {
   if (plug->has_music) {
     DetachAudioStreamProcessor(current_track()->music.stream, process_audio);
@@ -752,6 +1021,15 @@ Plug *plug_pre_reload(void) {
   return plug;
 }
 
+/**
+ * @brief Initializes plugin state and resources
+ *
+ * Called once at application startup. Sets up:
+ * - Plugin state structure
+ * - Default settings
+ * - Audio buffers
+ * - Assets loading
+ */
 void plug_init(void) {
   plug = calloc(1, sizeof(*plug));
   assert(plug);
@@ -764,6 +1042,7 @@ void plug_init(void) {
   plug->last_mouse_move_time = -100.0f;
   plug->volume_level = 1;
 
+  /* Initialize audio processing buffers */
   memset(samples, 0, sizeof(samples));
   memset(bars, 0, sizeof(bars));
   memset(&volume_slider, 0, sizeof(volume_slider));
@@ -772,11 +1051,23 @@ void plug_init(void) {
   SetTargetFPS(60);
 }
 
+/**
+ * @brief Main update loop - called every frame
+ *
+ * Handles:
+ * - Music stream updates
+ * - File dialog for initial load
+ * - Input processing
+ * - Audio visualization
+ * - Rendering all UI elements
+ */
 void plug_update(void) {
+  /* Update audio stream */
   if (plug->has_music && !plug->paused) {
     UpdateMusicStream(current_track()->music);
   }
 
+  /* Show file dialog on click when no music loaded */
   if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && !plug->has_music) {
     char const *filters[] = {"*.wav", "*.ogg", "*.mp3", "*.flac"};
     char const *path = tinyfd_openFileDialog(
@@ -802,10 +1093,13 @@ void plug_update(void) {
     }
   }
 
+  /* Process input and state updates */
   update_mouse_state();
   handle_input();
   handle_file_drop();
   next_track_in_queue();
+
+  /* Render frame */
   BeginDrawing();
   ClearBackground((Color){0x18, 0x18, 0x18, 0xFF});
 
