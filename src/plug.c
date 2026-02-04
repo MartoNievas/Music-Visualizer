@@ -61,6 +61,7 @@ typedef struct {
  */
 typedef enum {
   PLAY_UI_ICON,       ///< Play/pause button icon
+  FILE_UI_ICON,       ///< Finde files in directories
   VOLUME_UI_ICON,     ///< Volume control icon
   FULLSCREEN_UI_ICON, ///< Fullscreen toggle icon
   COUNT_UI_ICONS,     ///< Total number of icon types
@@ -110,10 +111,16 @@ typedef struct {
   // Volume config
   double master_vol;   ///< Master volume level (0.0 to 1.0)
   double volume_saved; ///< Saved volume for mute/unmute toggle
+
+  // Browser config
+  bool show_browser;      ///< Flag para mostrar/ocultar el explorador interno
+  FilePathList dir_files; ///< Lista de archivos en el directorio actual
+  char current_dir[512];
+  int browser_scroll;
 } Plug;
 
 /* Compile-time assertion to ensure icon array matches enum */
-static_assert(COUNT_UI_ICONS == 3, "Amount of icons changed");
+static_assert(COUNT_UI_ICONS == 4, "Amount of icons changed");
 
 /**
  * @brief File paths for UI icon resources
@@ -122,6 +129,7 @@ const static char *ui_resources_icons[COUNT_UI_ICONS] = {
     [FULLSCREEN_UI_ICON] = "resources/icons/fullscreen.png",
     [PLAY_UI_ICON] = "resources/icons/play.png",
     [VOLUME_UI_ICON] = "resources/icons/volume.png",
+    [FILE_UI_ICON] = "resources/icons/file.jpg",
 };
 
 /* Global state variables */
@@ -883,6 +891,18 @@ static void draw_ui_bar(void) {
     x_left += icon_size + padding;
   }
 
+  /*Draw file finder button*/
+  {
+    Texture2D tex = plug->icons_textures[FILE_UI_ICON];
+    float frame = 0;
+    float s = (float)tex.height;
+    Rectangle dst = {x_left, y, icon_size, icon_size};
+    Rectangle src = {frame * s, 0, s, s};
+    DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0, WHITE);
+    ui_recs[FILE_UI_ICON] = dst;
+    x_left += icon_size + padding;
+  }
+
   /* Draw volume button with slider */
   {
     Texture2D tex = plug->icons_textures[VOLUME_UI_ICON];
@@ -943,6 +963,8 @@ static void draw_ui_bar(void) {
   } else if (CheckCollisionPointRec(mouse, ui_recs[FULLSCREEN_UI_ICON])) {
     tooltip(ui_recs[FULLSCREEN_UI_ICON],
             plug->fullscreen ? "Collapse [F]" : "Expand [F]");
+  } else if (CheckCollisionPointRec(mouse, ui_recs[FILE_UI_ICON])) {
+    tooltip(ui_recs[FILE_UI_ICON], "Find File [O]");
   }
 }
 
@@ -1125,7 +1147,6 @@ static void load_assets(void) {
     data = plug_load_resoruces(ui_resources_icons[i], &data_size);
     Image image = LoadImageFromMemory(GetFileExtension(ui_resources_icons[i]),
                                       data, data_size);
-
     plug->icons_textures[i] = LoadTextureFromImage(image);
     GenTextureMipmaps(&plug->icons_textures[i]);
     SetTextureFilter(plug->icons_textures[i], TEXTURE_FILTER_BILINEAR);
@@ -1135,55 +1156,197 @@ static void load_assets(void) {
 }
 
 /**
-  @brief open a tiny dialogs for insert a music file
+ * @brief Attempts to load and append a music track to the playlist.
+ * @param path The system path to the music file.
+ * @return true if loaded successfully, false otherwise.
+ */
+static bool add_track_from_path(const char *path) {
+  if (!path)
+    return false;
+
+  Music music = LoadMusicStream(path);
+  if (!IsMusicValid(music)) {
+    plug->error = true;
+    return false;
+  }
+
+  char *path_copy = strdup(path);
+  if (!path_copy)
+    return false;
+
+  da_append(&plug->tracks, (CLITERAL(Track){
+                               .file_name = path_copy,
+                               .music = music,
+                           }));
+
+  plug->paused = false;
+  plug->error = false;
+
+  // Reset visualization buffers
+  memset(plug->samples, 0, sizeof(plug->samples));
+  atomic_store(&plug->sample_write, 0);
+
+  return true;
+}
+
+/**
+ * @brief Logic to navigate to parent directory.
+ */
+static void navigate_to_parent_dir(void) {
+  if (strcmp(plug->current_dir, "/") == 0)
+    return;
+
+  char *last_slash = strrchr(plug->current_dir, '/');
+  if (last_slash == plug->current_dir) {
+    strcpy(plug->current_dir, "/");
+  } else if (last_slash != NULL) {
+    *last_slash = '\0';
+  }
+
+  if (plug->dir_files.count > 0)
+    UnloadDirectoryFiles(plug->dir_files);
+  plug->dir_files = LoadDirectoryFiles(plug->current_dir);
+  plug->browser_scroll = 0;
+}
+
+/**
+ * @brief Draws the internal file browser with scroll and navigation.
+ */
+static void draw_internal_browser(void) {
+  if (!plug->show_browser)
+    return;
+
+  int w = GetRenderWidth();
+  int h = GetRenderHeight();
+  Rectangle browser_rec = {w * 0.1f, h * 0.1f, w * 0.8f, h * 0.8f};
+
+  DrawRectangleRec(browser_rec, (Color){0x12, 0x12, 0x12, 0xFA});
+  DrawRectangleLinesEx(browser_rec, 2, GRAY);
+  DrawText(TextFormat("Browsing: %s", plug->current_dir),
+           (int)browser_rec.x + 20, (int)browser_rec.y + 15, 20, SKYBLUE);
+
+  if (plug->dir_files.count == 0) {
+    plug->dir_files = LoadDirectoryFiles(plug->current_dir);
+  }
+
+  if (CheckCollisionPointRec(GetMousePosition(), browser_rec)) {
+    plug->browser_scroll += (int)(GetMouseWheelMove() * 35.0f);
+  }
+  if (plug->browser_scroll > 0)
+    plug->browser_scroll = 0;
+
+  if (IsKeyPressed(KEY_BACKSPACE)) {
+    navigate_to_parent_dir();
+  }
+
+  float item_h = 35.0f;
+  int render_i = 0;
+
+  BeginScissorMode((int)browser_rec.x, (int)browser_rec.y + 50,
+                   (int)browser_rec.width, (int)browser_rec.height - 60);
+
+  for (size_t i = 0; i < plug->dir_files.count; i++) {
+    const char *path = plug->dir_files.paths[i];
+    bool is_dir = DirectoryExists(path);
+    bool is_music =
+        IsFileExtension(path, ".mp3") || IsFileExtension(path, ".wav") ||
+        IsFileExtension(path, ".ogg") || IsFileExtension(path, ".flac");
+
+    if (!is_dir && !is_music)
+      continue;
+
+    Rectangle item_r = {browser_rec.x + 10,
+                        browser_rec.y + 60 + (render_i * item_h) +
+                            plug->browser_scroll,
+                        browser_rec.width - 20, item_h};
+    render_i++;
+
+    bool hovered = CheckCollisionPointRec(GetMousePosition(), item_r);
+    if (hovered) {
+      DrawRectangleRec(item_r, (Color){0x30, 0x30, 0x30, 0xFF});
+      if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+        if (is_dir) {
+          const char *dir_name = GetFileName(path);
+          if (strcmp(dir_name, "..") == 0) {
+            navigate_to_parent_dir();
+          } else if (strcmp(dir_name, ".") != 0) {
+            snprintf(plug->current_dir, sizeof(plug->current_dir), "%s", path);
+            UnloadDirectoryFiles(plug->dir_files);
+            plug->dir_files = LoadDirectoryFiles(plug->current_dir);
+            plug->browser_scroll = 0;
+          }
+          break;
+        } else {
+          if (add_track_from_path(path)) {
+            if (!plug->has_music) {
+              plug->has_music = true;
+              switch_track(0);
+            }
+            plug->show_browser = false;
+          }
+        }
+      }
+    }
+
+    const char *label =
+        is_dir ? TextFormat("[DIR] %s", GetFileName(path)) : GetFileName(path);
+    DrawText(label, (int)item_r.x + 10, (int)item_r.y + 8, 18,
+             is_dir ? GOLD : WHITE);
+  }
+  EndScissorMode();
+
+  if (IsKeyPressed(KEY_ESCAPE))
+    plug->show_browser = false;
+}
+
+static void handle_file_inputs(void) {
+  Vector2 mouse = GetMousePosition();
+
+  // ui_recs[FILE_UI_ICON] is defined in draw_ui_bar
+  bool icon_clicked = CheckCollisionPointRec(mouse, ui_recs[FILE_UI_ICON]) &&
+                      IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+
+  if (IsKeyPressed(KEY_O) || icon_clicked) {
+    plug->show_browser = !plug->show_browser;
+    if (plug->show_browser) {
+      // Clean up old list and force fresh reload from current_dir
+      if (plug->dir_files.count > 0)
+        UnloadDirectoryFiles(plug->dir_files);
+      plug->dir_files = LoadDirectoryFiles(plug->current_dir);
+      plug->browser_scroll = 0;
+    }
+  }
+}
+
+/**
+ * @brief Handles UI interactions and hotkeys for opening the file dialog.
  */
 static void handle_tiny_dialogs_open(void) {
   int w = GetRenderWidth();
   int h = GetRenderHeight();
+  const char *filters[] = {"*.wav", "*.ogg", "*.mp3", "*.flac"};
 
-  if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && !plug->has_music) {
+  // Logic for first-time load (empty state)
+  if (!plug->has_music) {
+    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+      const char *path = tinyfd_openFileDialog(
+          "Select Music", "./", ARRAY_LEN(filters), filters, "Music Files", 0);
+      if (add_track_from_path(path)) {
+        plug->has_music = true;
+        switch_track(0);
+      }
+    } else {
+      // Draw central call-to-action message
+      const char *msg = plug->error ? "Error: Could not load file"
+                                    : "Click to Select File\n(Or Drag & Drop)";
+      Color col = plug->error ? RED : WHITE;
+      Vector2 size =
+          MeasureTextEx(plug->font, msg, (float)plug->font.baseSize, 0);
+      Vector2 pos = {(w - size.x) / 2.0f, (h - size.y) / 2.0f};
 
-    char const *filters[] = {"*.wav", "*.ogg", "*.mp3", "*.flac"};
-    char const *path = tinyfd_openFileDialog(
-        "Select music", "./", ARRAY_LEN(filters), filters, "music", 0);
-
-    if (!path)
-      return;
-
-    Music music = LoadMusicStream(path);
-    if (!IsMusicValid(music)) {
-      plug->error = true;
-      return;
+      DrawTextEx(plug->font, msg, pos, (float)plug->font.baseSize, 0, col);
     }
-
-    char *copy = strdup(path);
-    assert(copy);
-
-    da_append(&plug->tracks, (CLITERAL(Track){
-                                 .file_name = copy,
-                                 .music = music,
-                             }));
-
-    plug->has_music = true;
-    plug->paused = false;
-    plug->error = false;
-
-    memset(plug->samples, 0, sizeof(plug->samples));
-    atomic_store(&plug->sample_write, 0);
-
-    switch_track(0);
-  } else if (!plug->has_music) {
-    const char *msg = plug->error
-                          ? "Could not load file"
-                          : " Select File On Click\n (Or Just Drop Here)";
-
-    Color col = plug->error ? RED : WHITE;
-    Vector2 size =
-        MeasureTextEx(plug->font, msg, (float)plug->font.baseSize, 0);
-
-    DrawTextEx(plug->font, msg,
-               (Vector2){w / 2.0f - size.x / 2, h / 2.0f - size.y / 2},
-               (float)plug->font.baseSize, 0, col);
+    return;
   }
 }
 
@@ -1252,6 +1415,12 @@ void plug_init(void) {
   plug->sample_write = 0;
   plug->master_vol = 0.5f;
   plug->volume_saved = 0;
+  const char *home = getenv("HOME");
+  if (home) {
+    snprintf(plug->current_dir, sizeof(plug->current_dir), "%s/Musica", home);
+  } else {
+    strcpy(plug->current_dir, "."); // Fallback to current directory
+  }
   /* Initialize audio processing buffers */
   memset(plug->samples, 0, sizeof(plug->samples));
   memset(bars, 0, sizeof(bars));
@@ -1284,6 +1453,7 @@ void plug_update(void) {
   handle_file_drop();
   next_track_in_queue();
 
+  handle_file_inputs();
   /* Render frame */
   BeginDrawing();
   ClearBackground((Color){0x18, 0x18, 0x18, 0xFF});
@@ -1296,5 +1466,6 @@ void plug_update(void) {
   draw_ui_bar();
   draw_volume_slider();
 
+  draw_internal_browser();
   EndDrawing();
 }
