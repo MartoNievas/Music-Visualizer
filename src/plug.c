@@ -654,7 +654,6 @@ static void draw_bars(void) {
  */
 static void update_visualizer(void) {
   if (plug->has_music && !plug->paused) {
-    // Actualizar timer de estabilización
     if (plug->is_stabilizing) {
       plug->stabilization_timer -= GetFrameTime();
       if (plug->stabilization_timer <= 0.0f) {
@@ -662,7 +661,6 @@ static void update_visualizer(void) {
       }
     }
 
-    // 1. Initialize Hann window (once)
     if (!plug->window_ready) {
       for (size_t i = 0; i < N; i++) {
         plug->window[i] = 0.5f * (1.0f - cosf(2.0f * PI * i / (N - 1)));
@@ -670,7 +668,6 @@ static void update_visualizer(void) {
       plug->window_ready = true;
     }
 
-    // 2. Apply window function
     float tmp[N];
     unsigned w =
         atomic_load_explicit(&plug->sample_write, memory_order_acquire);
@@ -679,10 +676,8 @@ static void update_visualizer(void) {
       tmp[i] = plug->samples[idx] * plug->window[i];
     }
 
-    // 3. Compute FFT
     compute_fft(tmp, 1, plug->spectrum, N);
 
-    // 4. Find maximum amplitude for normalization
     float max_amp = 1e-6f;
     for (size_t i = 0; i < N / 2; i++) {
       float a = get_amplitude(plug->spectrum[i]);
@@ -690,7 +685,6 @@ static void update_visualizer(void) {
         max_amp = a;
     }
 
-    // PROTECCIÓN: Evita normalización excesiva durante estabilización
     if (plug->is_stabilizing) {
       if (max_amp < 0.01f)
         max_amp = 0.01f;
@@ -721,7 +715,6 @@ static void update_visualizer(void) {
 
       float normalized = band_max / max_amp;
 
-      // 5. Bass Boost Logic
       float bass_boost = 1.0f;
       if (i < bass_bands) {
         float bass_factor = 1.0f - ((float)i / bass_bands);
@@ -732,15 +725,19 @@ static void update_visualizer(void) {
       float target = normalized * bass_boost;
       target = sqrtf(target);
 
-      // PROTECCIÓN: Limita valores extremos durante estabilización
       if (plug->is_stabilizing) {
         if (target > 0.6f) {
-          target *= 0.4f; // Reduce picos agresivamente
+          target *= 0.4f;
         }
       }
 
       plug->overall_level = 0.95f * plug->overall_level + 0.05f * normalized;
       target *= (1.0f + plug->overall_level * 0.5f);
+
+      if (target > 0.85f) {
+        float excess = target - 0.85f;
+        target = 0.85f + excess * 0.3f;
+      }
 
       if (target > 1.5f)
         target = 1.5f;
@@ -753,10 +750,9 @@ static void update_visualizer(void) {
       float smoothness_up = 20.0f + plug->bass_history * 10.0f;
       float smoothness_down = 4.5f + plug->bass_history * 2.0f;
 
-      // PROTECCIÓN ADICIONAL: Suavizado más agresivo durante estabilización
       if (plug->is_stabilizing) {
-        smoothness_up *= 0.3f;   // Más lento al subir
-        smoothness_down *= 2.0f; // Más rápido al bajar
+        smoothness_up *= 0.3f;
+        smoothness_down *= 2.0f;
       }
 
       if (target > plug->bars[i]) {
