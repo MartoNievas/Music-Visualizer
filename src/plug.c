@@ -521,11 +521,11 @@ static void draw_bars(void) {
   if (plug->fullscreen) {
     if (plug->mouse_active) {
       // Con UI visible: barras más pequeñas para dejar espacio a la UI
-      base_y = h * 0.90f;
+      base_y = h * 0.95f;
       max_bar_height_factor = 0.70f; // Reducido de 0.75f
     } else {
       // Sin UI: barras limitadas para no llegar al borde
-      base_y = h * 0.95f;            // Cambiado de h
+      base_y = h;                    // Cambiado de h
       max_bar_height_factor = 0.75f; // Reducido de 0.90f
     }
   } else {
