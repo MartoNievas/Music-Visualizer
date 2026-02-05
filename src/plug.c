@@ -92,33 +92,45 @@ typedef struct {
   float circle_radius_location;
   float circle_power_location;
 
-  bool error;           ///< Error state flag
-  bool has_music;       ///< Whether any music is loaded
-  bool paused;          ///< Playback pause state
-  bool fullscreen;      ///< Fullscreen visualization mode
-  unsigned sample_rate; ///< Current track sample rate
-
-  int volume_level; ///< Volume level indicator (0-2: muted, low, high)
+  bool error;      ///< Error state flag
+  bool has_music;  ///< Whether any music is loaded
+  bool paused;     ///< Playback pause state
+  bool fullscreen; ///< Fullscreen visualization mode
 
   double last_mouse_move_time; ///< Timestamp of last mouse movement
   bool mouse_active;           ///< Whether mouse is recently active
 
-  float samples[N];
-  atomic_uint sample_write;
-
   float queue_scroll; ///< Queue panel scroll offset
 
   // Volume config
-  double master_vol;   ///< Master volume level (0.0 to 1.0)
-  double volume_saved; ///< Saved volume for mute/unmute toggle
+  VolumeSlider volume_slider; ///< Volume slider state
+  double master_vol;          ///< Master volume level (0.0 to 1.0)
+  double volume_saved;        ///< Saved volume for mute/unmute toggle
+  int volume_level; ///< Volume level indicator (0-2: muted, low, high)
 
   // Browser config
   bool show_browser;      ///< Flag para mostrar/ocultar el explorador interno
   FilePathList dir_files; ///< Lista de archivos en el directorio actual
   char current_dir[512];
   int browser_scroll;
-} Plug;
 
+  Rectangle ui_recs[COUNT_UI_ICONS]; ///< Collision rectangles for UI buttons
+                                     ///< Global plugin instance
+
+  /* Audio processing buffers */
+  unsigned sample_rate; ///< Current track sample rate
+  float samples[N];
+  atomic_uint sample_write;
+  float window[N];           ///< Hann window for FFT
+  float complex spectrum[N]; ///< FFT output spectrum
+  float smear[BARS];         ///< Smear effect buffer for motion blur
+  float bars[BARS];          ///< Smoothed bar heights for visualization
+  bool window_ready;         ///< Whether Hann window is initialized
+
+  float bass_history;  ///< Persistent low-frequency energy state
+  float overall_level; ///< Persistent overall volume level for dynamic scaling
+} Plug;
+Plug *plug = NULL;
 /* Compile-time assertion to ensure icon array matches enum */
 static_assert(COUNT_UI_ICONS == 4, "Amount of icons changed");
 
@@ -133,16 +145,6 @@ const static char *ui_resources_icons[COUNT_UI_ICONS] = {
 };
 
 /* Global state variables */
-static Rectangle
-    ui_recs[COUNT_UI_ICONS]; ///< Collision rectangles for UI buttons
-static Plug *plug = NULL;    ///< Global plugin instance
-static VolumeSlider volume_slider = {0}; ///< Volume slider state
-
-/* Audio processing buffers */
-static float window[N];           ///< Hann window for FFT
-static float complex spectrum[N]; ///< FFT output spectrum
-static float bars[BARS];          ///< Smoothed bar heights for visualization
-static bool window_ready = false; ///< Whether Hann window is initialized
 
 /**
  * @brief Frees resources loaded by plug_load_resources
@@ -312,7 +314,7 @@ static void draw_progress(void) {
     /* Check if clicking on UI buttons (to avoid conflict) */
     bool clicking_ui_button = false;
     for (int i = 0; i < COUNT_UI_ICONS; i++) {
-      if (CheckCollisionPointRec(m, ui_recs[i])) {
+      if (CheckCollisionPointRec(m, plug->ui_recs[i])) {
         clicking_ui_button = true;
         break;
       }
@@ -357,6 +359,16 @@ static void switch_track(int index) {
     plug->current_track = 0;
   else
     plug->current_track = index;
+
+  /* Reset visualization buffers for clean transition */
+  memset(plug->samples, 0, sizeof(plug->samples));
+  memset(plug->bars, 0, sizeof(plug->bars));
+  memset(plug->smear, 0, sizeof(plug->smear));
+  memset(plug->spectrum, 0, sizeof(plug->spectrum));
+  atomic_store(&plug->sample_write, 0);
+
+  plug->bass_history = 0.0f;
+  plug->overall_level = 0.5f;
 
   /* Setup and start new track */
   Track *next = current_track();
@@ -475,10 +487,10 @@ static void draw_queue(void) {
 }
 
 /**
- * @brief Renders frequency visualization bars with advanced effects
+ * @brief Renders frequency visualization plug->bars with advanced effects
  *
- * Draws BARS with:
- * - Smooth lines as bars
+ * Draws plug->bars with:
+ * - Smooth lines as plug->bars
  * - Glowing circles at tips
  * - Smear trails for motion blur effect
  * - Rainbow HSV coloring
@@ -498,7 +510,6 @@ static void draw_bars(void) {
       plug->fullscreen ? (plug->mouse_active ? h * 0.95f : h) : h - 150;
 
   /* Static array for smear effect (motion blur) */
-  static float smear[BARS] = {0};
 
   /* Global visual parameters */
   float saturation = 0.75f;
@@ -506,7 +517,7 @@ static void draw_bars(void) {
 
   /* PASS 1: Draw bar lines */
   for (int i = 0; i < BARS; i++) {
-    float intensity = bars[i];
+    float intensity = plug->bars[i];
     if (intensity > 1.2f)
       intensity = 1.2f;
     if (intensity < 0.0f)
@@ -514,7 +525,8 @@ static void draw_bars(void) {
 
     /* Update smear with slower decay */
     float smear_speed = 3.0f;
-    smear[i] += (intensity - smear[i]) * smear_speed * GetFrameTime();
+    plug->smear[i] +=
+        (intensity - plug->smear[i]) * smear_speed * GetFrameTime();
 
     /* Calculate positions */
     float bar_height = intensity * h * (plug->fullscreen ? 0.85f : 0.6f);
@@ -547,13 +559,13 @@ static void draw_bars(void) {
 
   BeginShaderMode(plug->circle);
   for (int i = 0; i < BARS; i++) {
-    float intensity = bars[i];
+    float intensity = plug->bars[i];
     if (intensity < 0.0f)
       intensity = 0.0f;
     if (intensity > 1.2f)
       intensity = 1.2f;
 
-    float start_height = smear[i] * h * (plug->fullscreen ? 0.85f : 0.6f);
+    float start_height = plug->smear[i] * h * (plug->fullscreen ? 0.85f : 0.6f);
     float end_height = intensity * h * (plug->fullscreen ? 0.85f : 0.6f);
 
     float x = start_x + i * cell_width + cell_width / 2;
@@ -586,7 +598,7 @@ static void draw_bars(void) {
 
   BeginShaderMode(plug->circle);
   for (int i = 0; i < BARS; i++) {
-    float intensity = bars[i];
+    float intensity = plug->bars[i];
     if (intensity < 0.0f)
       intensity = 0.0f;
     if (intensity > 1.2f)
@@ -609,7 +621,7 @@ static void draw_bars(void) {
 }
 
 /**
- * @brief Updates visualization by computing FFT and smoothing bars
+ * @brief Updates visualization by computing FFT and smoothing plug->bars
  *
  * Processing pipeline:
  * 1. Apply Hann window to samples
@@ -619,121 +631,100 @@ static void draw_bars(void) {
  */
 static void update_visualizer(void) {
   if (plug->has_music && !plug->paused) {
-    /* Initialize Hann window (once) */
-    if (!window_ready) {
+    // 1. Initialize Hann window (once)
+    if (!plug->window_ready) {
       for (size_t i = 0; i < N; i++) {
-        window[i] = 0.5f * (1.0f - cosf(2.0f * PI * i / (N - 1)));
+        plug->window[i] = 0.5f * (1.0f - cosf(2.0f * PI * i / (N - 1)));
       }
-      window_ready = true;
+      plug->window_ready = true;
     }
 
-    /* Apply window function to reduce spectral leakage */
+    // 2. Apply window function
     float tmp[N];
     unsigned w =
         atomic_load_explicit(&plug->sample_write, memory_order_acquire);
 
     for (size_t i = 0; i < N; i++) {
       size_t idx = (w + i) % N;
-      tmp[i] = plug->samples[idx] * window[i];
+      tmp[i] = plug->samples[idx] * plug->window[i];
     }
 
-    /* Compute frequency spectrum */
-    compute_fft(tmp, 1, spectrum, N);
+    // 3. Compute FFT
+    compute_fft(tmp, 1, plug->spectrum, N);
 
-    /* Find maximum amplitude for normalization */
+    // 4. Find maximum amplitude for normalization
     float max_amp = 1e-6f;
     for (size_t i = 0; i < N / 2; i++) {
-      float a = get_amplitude(spectrum[i]);
+      float a = get_amplitude(plug->spectrum[i]);
       if (a > max_amp)
         max_amp = a;
     }
 
-    /* Define audible frequency range */
     float freq_min = 20.0f;
     float freq_max = plug->sample_rate * 0.5f;
+    int bass_bands = 8;
 
-    /* Enhanced bass boost parameters */
-    static float bass_history = 0.0f;
+    // FIX: current_bass_energy declared only once here
     float current_bass_energy = 0.0f;
-    int bass_bands = 8; // Number of bands considered as bass (first 8)
 
-    /* Map spectrum to logarithmic frequency bars */
     for (int i = 0; i < BARS; i++) {
-      /* Calculate frequency range for this bar (log scale) */
       float t0 = (float)i / BARS;
       float t1 = (float)(i + 1) / BARS;
 
       float f0 = freq_min * powf(freq_max / freq_min, t0);
       float f1 = freq_min * powf(freq_max / freq_min, t1);
 
-      /* Convert to spectrum bin indices */
       size_t k0 = (size_t)(f0 * N / plug->sample_rate);
       size_t k1 = (size_t)(f1 * N / plug->sample_rate);
-
       if (k1 <= k0)
         k1 = k0 + 1;
 
-      /* Enhanced: Find maximum amplitude in band (not average) for better
-       * response */
       float band_max = 0.0f;
       for (size_t k = k0; k < k1 && k < N / 2; k++) {
-        float a = get_amplitude(spectrum[k]);
+        float a = get_amplitude(plug->spectrum[k]);
         if (a > band_max)
           band_max = a;
       }
 
-      /* Normalize */
       float normalized = band_max / max_amp;
 
-      /* ENHANCED BASS BOOST: Stronger and more dynamic */
+      // 5. Bass Boost Logic
       float bass_boost = 1.0f;
       if (i < bass_bands) {
-        // Stronger boost for lower frequencies
-        float bass_factor =
-            1.0f - ((float)i /
-                    bass_bands); // 1.0 for lowest, 0.0 for highest bass band
-        bass_boost = 1.0f + bass_factor *
-                                3.5f; // Up to 4.5x boost for lowest frequencies
-
-        // Track bass energy for dynamic response
+        float bass_factor = 1.0f - ((float)i / bass_bands);
+        bass_boost = 1.0f + bass_factor * 3.5f;
         current_bass_energy += normalized;
       }
+
       float target = normalized * bass_boost;
+      target = sqrtf(target);
 
-      /* Apply compression for better dynamic range */
-      target = sqrtf(target); // Square root compression
-
-      /* Dynamic scaling based on overall volume */
-      static float overall_level = 0.5f;
-      overall_level = 0.95f * overall_level + 0.05f * normalized;
-      target *= (1.0f + overall_level * 0.5f); // Scale up when music is louder
+      // FIX: Use plug->overall_level instead of static local
+      plug->overall_level = 0.95f * plug->overall_level + 0.05f * normalized;
+      target *= (1.0f + plug->overall_level * 0.5f);
 
       if (target > 1.5f)
         target = 1.5f;
 
-      /* Update bass history for dynamic response */
-      if (i == 0) { // Use first band as bass indicator
-        bass_history = 0.9f * bass_history + 0.1f * target;
+      if (i == 0) {
+        // FIX: Use plug->bass_history instead of static local
+        plug->bass_history = 0.9f * plug->bass_history + 0.1f * target;
       }
 
-      /* INERCIA: Interpolacion dependiente del tiempo */
       float dt = GetFrameTime();
+      float smoothness_up = 20.0f + plug->bass_history * 10.0f;
+      float smoothness_down = 4.5f + plug->bass_history * 2.0f;
 
-      // Adaptive smoothing: faster when bass is strong
-      float smoothness_up = 20.0f + bass_history * 10.0f; // 20-30
-      float smoothness_down = 4.5f + bass_history * 2.0f; // 4.5-6.5
-
-      if (target > bars[i]) {
-        bars[i] += (target - bars[i]) * smoothness_up * dt;
+      if (target > plug->bars[i]) {
+        plug->bars[i] += (target - plug->bars[i]) * smoothness_up * dt;
       } else {
-        bars[i] += (target - bars[i]) * smoothness_down * dt;
+        plug->bars[i] += (target - plug->bars[i]) * smoothness_down * dt;
       }
 
-      /* Clamp final */
-      if (bars[i] < 0.0f)
-        bars[i] = 0.0f;
-      if (bars[i] > 1.5f) // Slightly higher limit for boosted bass
-        bars[i] = 1.5f;
+      if (plug->bars[i] < 0.0f)
+        plug->bars[i] = 0.0f;
+      if (plug->bars[i] > 1.5f)
+        plug->bars[i] = 1.5f;
     }
   }
 }
@@ -745,17 +736,17 @@ static void update_visualizer(void) {
  * Allows click-and-drag to adjust volume level.
  */
 static void draw_volume_slider(void) {
-  if (!volume_slider.visible)
+  if (!plug->volume_slider.visible)
     return;
 
-  Rectangle slider = volume_slider.bounds;
+  Rectangle slider = plug->volume_slider.bounds;
 
   /* Draw slider background */
   DrawRectangleRec(slider, (Color){0x20, 0x20, 0x20, 0xF0});
   DrawRectangleLinesEx(slider, 1, (Color){0x50, 0x50, 0x50, 0xFF});
 
   /* Draw filled portion */
-  float fill_width = slider.width * volume_slider.value;
+  float fill_width = slider.width * plug->volume_slider.value;
   Rectangle fill = {slider.x, slider.y, fill_width, slider.height};
 
   DrawRectangleRec(fill, (Color){100, 180, 255, 220});
@@ -769,7 +760,7 @@ static void draw_volume_slider(void) {
   /* Draw percentage text */
   char percent_text[16];
   snprintf(percent_text, sizeof(percent_text), "%d%%",
-           (int)(volume_slider.value * 100));
+           (int)(plug->volume_slider.value * 100));
   DrawText(percent_text, slider.x + slider.width + 10,
            slider.y + (slider.height - 10) * 0.5f, 10, WHITE);
 
@@ -787,7 +778,7 @@ static void draw_volume_slider(void) {
       if (new_value > 1.0f)
         new_value = 1.0f;
 
-      volume_slider.value = new_value;
+      plug->volume_slider.value = new_value;
       plug->master_vol = new_value;
       SetMusicVolume(current_track()->music, plug->master_vol);
 
@@ -887,7 +878,7 @@ static void draw_ui_bar(void) {
     Rectangle dst = {x_left, y, icon_size, icon_size};
     Rectangle src = {frame * s, 0, s, s};
     DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0, WHITE);
-    ui_recs[PLAY_UI_ICON] = dst;
+    plug->ui_recs[PLAY_UI_ICON] = dst;
     x_left += icon_size + padding;
   }
 
@@ -899,7 +890,7 @@ static void draw_ui_bar(void) {
     Rectangle dst = {x_left, y, icon_size, icon_size};
     Rectangle src = {frame * s, 0, s, s};
     DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0, WHITE);
-    ui_recs[FILE_UI_ICON] = dst;
+    plug->ui_recs[FILE_UI_ICON] = dst;
     x_left += icon_size + padding;
   }
 
@@ -911,7 +902,7 @@ static void draw_ui_bar(void) {
     Rectangle dst = {x_left, y, icon_size, icon_size};
     Rectangle src = {frame * s, 0, s, s};
     DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0, WHITE);
-    ui_recs[VOLUME_UI_ICON] = dst;
+    plug->ui_recs[VOLUME_UI_ICON] = dst;
 
     Vector2 mouse = GetMousePosition();
 
@@ -925,11 +916,11 @@ static void draw_ui_bar(void) {
     /* Show slider when hovering over icon or slider itself */
     if (CheckCollisionPointRec(mouse, dst) ||
         CheckCollisionPointRec(mouse, slider_bounds)) {
-      volume_slider.visible = true;
-      volume_slider.bounds = slider_bounds;
-      volume_slider.value = (float)plug->master_vol;
+      plug->volume_slider.visible = true;
+      plug->volume_slider.bounds = slider_bounds;
+      plug->volume_slider.value = (float)plug->master_vol;
     } else {
-      volume_slider.visible = false;
+      plug->volume_slider.visible = false;
     }
     x_left += icon_size + padding;
   }
@@ -940,7 +931,7 @@ static void draw_ui_bar(void) {
     float s = (float)tex.height;
     float x_right = bar.x + bar.width - padding - icon_size;
     Rectangle dst = {x_right, y, icon_size, icon_size};
-    ui_recs[FULLSCREEN_UI_ICON] = dst;
+    plug->ui_recs[FULLSCREEN_UI_ICON] = dst;
 
     bool is_hovered = CheckCollisionPointRec(GetMousePosition(), dst);
     /* Select sprite: 0=windowed, 1=windowed+hover, 2=fullscreen,
@@ -954,17 +945,17 @@ static void draw_ui_bar(void) {
 
   /* Draw tooltips on hover */
   Vector2 mouse = GetMousePosition();
-  if (CheckCollisionPointRec(mouse, ui_recs[PLAY_UI_ICON])) {
-    tooltip(ui_recs[PLAY_UI_ICON],
+  if (CheckCollisionPointRec(mouse, plug->ui_recs[PLAY_UI_ICON])) {
+    tooltip(plug->ui_recs[PLAY_UI_ICON],
             plug->paused ? "Play [SPACE]" : "Pause [SPACE]");
-  } else if (CheckCollisionPointRec(mouse, ui_recs[VOLUME_UI_ICON])) {
-    tooltip(ui_recs[VOLUME_UI_ICON],
+  } else if (CheckCollisionPointRec(mouse, plug->ui_recs[VOLUME_UI_ICON])) {
+    tooltip(plug->ui_recs[VOLUME_UI_ICON],
             plug->volume_level == 0 ? "Unmute [M]" : "Mute [M]");
-  } else if (CheckCollisionPointRec(mouse, ui_recs[FULLSCREEN_UI_ICON])) {
-    tooltip(ui_recs[FULLSCREEN_UI_ICON],
+  } else if (CheckCollisionPointRec(mouse, plug->ui_recs[FULLSCREEN_UI_ICON])) {
+    tooltip(plug->ui_recs[FULLSCREEN_UI_ICON],
             plug->fullscreen ? "Collapse [F]" : "Expand [F]");
-  } else if (CheckCollisionPointRec(mouse, ui_recs[FILE_UI_ICON])) {
-    tooltip(ui_recs[FILE_UI_ICON], "Find File [O]");
+  } else if (CheckCollisionPointRec(mouse, plug->ui_recs[FILE_UI_ICON])) {
+    tooltip(plug->ui_recs[FILE_UI_ICON], "Find File [O]");
   }
 }
 
@@ -1036,7 +1027,7 @@ static void handle_input(void) {
   /* Toggle mute (keyboard or click on volume icon) */
   Vector2 mouse = GetMousePosition();
   if (IsKeyPressed(KEY_M) ||
-      (CheckCollisionPointRec(mouse, ui_recs[VOLUME_UI_ICON]) &&
+      (CheckCollisionPointRec(mouse, plug->ui_recs[VOLUME_UI_ICON]) &&
        IsMouseButtonPressed(MOUSE_BUTTON_LEFT))) {
     if (plug->master_vol > 0.0f) {
       plug->volume_saved = plug->master_vol;
@@ -1046,7 +1037,7 @@ static void handle_input(void) {
           (plug->volume_saved > 0.0f) ? plug->volume_saved : 0.5f;
     }
     SetMusicVolume(current_track()->music, plug->master_vol);
-    volume_slider.value = plug->master_vol;
+    plug->volume_slider.value = plug->master_vol;
     plug->volume_level =
         (plug->master_vol <= 0.01f) ? 0 : (plug->master_vol <= 0.65f ? 1 : 2);
   }
@@ -1060,7 +1051,7 @@ static void handle_input(void) {
   /* Handle UI button clicks */
   if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && is_ui_bar_active()) {
 
-    if (CheckCollisionPointRec(mouse, ui_recs[PLAY_UI_ICON])) {
+    if (CheckCollisionPointRec(mouse, plug->ui_recs[PLAY_UI_ICON])) {
       plug->paused = !plug->paused;
 
       if (plug->paused)
@@ -1069,7 +1060,7 @@ static void handle_input(void) {
         ResumeMusicStream(current_track()->music);
     }
 
-    else if (CheckCollisionPointRec(mouse, ui_recs[FULLSCREEN_UI_ICON])) {
+    else if (CheckCollisionPointRec(mouse, plug->ui_recs[FULLSCREEN_UI_ICON])) {
       plug->fullscreen = !plug->fullscreen;
     }
   }
@@ -1179,12 +1170,7 @@ static bool add_track_from_path(const char *path) {
                                .music = music,
                            }));
 
-  plug->paused = false;
   plug->error = false;
-
-  // Reset visualization buffers
-  memset(plug->samples, 0, sizeof(plug->samples));
-  atomic_store(&plug->sample_write, 0);
 
   return true;
 }
@@ -1280,9 +1266,13 @@ static void draw_internal_browser(void) {
         } else {
           if (add_track_from_path(path)) {
             if (!plug->has_music) {
+              // Primera canción: siempre reproducir
               plug->has_music = true;
               switch_track(0);
             }
+            // Si ya hay música, simplemente agregar a la cola
+            // No cambiar automáticamente de track
+
             plug->show_browser = false;
           }
         }
@@ -1303,9 +1293,10 @@ static void draw_internal_browser(void) {
 static void handle_file_inputs(void) {
   Vector2 mouse = GetMousePosition();
 
-  // ui_recs[FILE_UI_ICON] is defined in draw_ui_bar
-  bool icon_clicked = CheckCollisionPointRec(mouse, ui_recs[FILE_UI_ICON]) &&
-                      IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+  // plug->ui_recs[FILE_UI_ICON] is defined in draw_ui_bar
+  bool icon_clicked =
+      CheckCollisionPointRec(mouse, plug->ui_recs[FILE_UI_ICON]) &&
+      IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
 
   if (IsKeyPressed(KEY_O) || icon_clicked) {
     plug->show_browser = !plug->show_browser;
@@ -1440,6 +1431,10 @@ void plug_init(void) {
   plug->sample_write = 0;
   plug->master_vol = 0.5f;
   plug->volume_saved = 0;
+  plug->window_ready = false;
+
+  plug->bass_history = 0.0f;
+  plug->overall_level = 0.5f;
   const char *home = getenv("HOME");
   if (home) {
     snprintf(plug->current_dir, sizeof(plug->current_dir), "%s/Musica", home);
@@ -1448,9 +1443,10 @@ void plug_init(void) {
   }
   /* Initialize audio processing buffers */
   memset(plug->samples, 0, sizeof(plug->samples));
-  memset(bars, 0, sizeof(bars));
-  memset(&volume_slider, 0, sizeof(volume_slider));
-
+  memset(plug->bars, 0, sizeof(plug->bars));
+  memset(&plug->volume_slider, 0, sizeof(plug->volume_slider));
+  memset(plug->smear, 0, sizeof(plug->smear));
+  memset(plug->spectrum, 0, sizeof(plug->spectrum));
   SetMasterVolume(plug->master_vol);
   SetTargetFPS(60);
 }
