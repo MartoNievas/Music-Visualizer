@@ -2,6 +2,8 @@
 
 A music visualizer application built with Raylib that provides real-time audio visualization with an integrated file browser and playback controls.
 
+<video src="./resources/muestra.mp4" controls width="100%"></video>
+
 ## Features
 
 - 🎵 Real-time audio visualization

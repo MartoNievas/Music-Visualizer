@@ -513,10 +513,26 @@ static void draw_bars(void) {
   float start_x = plug->fullscreen ? 0 : w * 0.20f;
   float available_w = plug->fullscreen ? w : w * 0.80f;
   float cell_width = available_w / BARS;
-  float base_y =
-      plug->fullscreen ? (plug->mouse_active ? h * 0.95f : h) : h - 150;
 
-  /* Static array for smear effect (motion blur) */
+  /* FIX: Ajustar base_y y max_bar_height para evitar overflow */
+  float base_y;
+  float max_bar_height_factor;
+
+  if (plug->fullscreen) {
+    if (plug->mouse_active) {
+      // Con UI visible: barras más pequeñas para dejar espacio a la UI
+      base_y = h * 0.90f;
+      max_bar_height_factor = 0.70f; // Reducido de 0.75f
+    } else {
+      // Sin UI: barras limitadas para no llegar al borde
+      base_y = h * 0.95f;            // Cambiado de h
+      max_bar_height_factor = 0.75f; // Reducido de 0.90f
+    }
+  } else {
+    // Modo ventana: espacio para UI inferior
+    base_y = h - 150;
+    max_bar_height_factor = 0.6f;
+  }
 
   /* Global visual parameters */
   float saturation = 0.75f;
@@ -535,8 +551,8 @@ static void draw_bars(void) {
     plug->smear[i] +=
         (intensity - plug->smear[i]) * smear_speed * GetFrameTime();
 
-    /* Calculate positions */
-    float bar_height = intensity * h * (plug->fullscreen ? 0.85f : 0.6f);
+    /* Calculate positions with corrected height */
+    float bar_height = intensity * h * max_bar_height_factor;
     float x = start_x + i * cell_width + cell_width / 2;
     float y_top = base_y - bar_height;
 
@@ -572,8 +588,8 @@ static void draw_bars(void) {
     if (intensity > 1.2f)
       intensity = 1.2f;
 
-    float start_height = plug->smear[i] * h * (plug->fullscreen ? 0.85f : 0.6f);
-    float end_height = intensity * h * (plug->fullscreen ? 0.85f : 0.6f);
+    float start_height = plug->smear[i] * h * max_bar_height_factor;
+    float end_height = intensity * h * max_bar_height_factor;
 
     float x = start_x + i * cell_width + cell_width / 2;
     float y_start = base_y - start_height;
@@ -611,7 +627,7 @@ static void draw_bars(void) {
     if (intensity > 1.2f)
       intensity = 1.2f;
 
-    float bar_height = intensity * h * (plug->fullscreen ? 0.85f : 0.6f);
+    float bar_height = intensity * h * max_bar_height_factor;
     float x = start_x + i * cell_width + cell_width / 2;
     float y = base_y - bar_height;
 
