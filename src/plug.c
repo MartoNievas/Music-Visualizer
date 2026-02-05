@@ -129,6 +129,9 @@ typedef struct {
 
   float bass_history;  ///< Persistent low-frequency energy state
   float overall_level; ///< Persistent overall volume level for dynamic scaling
+
+  float stabilization_timer;
+  bool is_stabilizing;
 } Plug;
 Plug *plug = NULL;
 /* Compile-time assertion to ensure icon array matches enum */
@@ -348,6 +351,7 @@ static void switch_track(int index) {
   Track *prev = current_track();
   if (prev) {
     StopMusicStream(prev->music);
+    WaitTime(0.05f);
     DetachAudioStreamProcessor(prev->music.stream, process_audio);
   }
 
@@ -379,6 +383,9 @@ static void switch_track(int index) {
 
   plug->paused = false;
   plug->has_music = true;
+
+  plug->is_stabilizing = true;
+  plug->stabilization_timer = 0.5f;
 }
 
 /**
@@ -631,6 +638,14 @@ static void draw_bars(void) {
  */
 static void update_visualizer(void) {
   if (plug->has_music && !plug->paused) {
+    // Actualizar timer de estabilización
+    if (plug->is_stabilizing) {
+      plug->stabilization_timer -= GetFrameTime();
+      if (plug->stabilization_timer <= 0.0f) {
+        plug->is_stabilizing = false;
+      }
+    }
+
     // 1. Initialize Hann window (once)
     if (!plug->window_ready) {
       for (size_t i = 0; i < N; i++) {
@@ -643,7 +658,6 @@ static void update_visualizer(void) {
     float tmp[N];
     unsigned w =
         atomic_load_explicit(&plug->sample_write, memory_order_acquire);
-
     for (size_t i = 0; i < N; i++) {
       size_t idx = (w + i) % N;
       tmp[i] = plug->samples[idx] * plug->window[i];
@@ -660,20 +674,23 @@ static void update_visualizer(void) {
         max_amp = a;
     }
 
+    // PROTECCIÓN: Evita normalización excesiva durante estabilización
+    if (plug->is_stabilizing) {
+      if (max_amp < 0.01f)
+        max_amp = 0.01f;
+    }
+
     float freq_min = 20.0f;
     float freq_max = plug->sample_rate * 0.5f;
     int bass_bands = 8;
 
-    // FIX: current_bass_energy declared only once here
     float current_bass_energy = 0.0f;
 
     for (int i = 0; i < BARS; i++) {
       float t0 = (float)i / BARS;
       float t1 = (float)(i + 1) / BARS;
-
       float f0 = freq_min * powf(freq_max / freq_min, t0);
       float f1 = freq_min * powf(freq_max / freq_min, t1);
-
       size_t k0 = (size_t)(f0 * N / plug->sample_rate);
       size_t k1 = (size_t)(f1 * N / plug->sample_rate);
       if (k1 <= k0)
@@ -699,7 +716,13 @@ static void update_visualizer(void) {
       float target = normalized * bass_boost;
       target = sqrtf(target);
 
-      // FIX: Use plug->overall_level instead of static local
+      // PROTECCIÓN: Limita valores extremos durante estabilización
+      if (plug->is_stabilizing) {
+        if (target > 0.6f) {
+          target *= 0.4f; // Reduce picos agresivamente
+        }
+      }
+
       plug->overall_level = 0.95f * plug->overall_level + 0.05f * normalized;
       target *= (1.0f + plug->overall_level * 0.5f);
 
@@ -707,13 +730,18 @@ static void update_visualizer(void) {
         target = 1.5f;
 
       if (i == 0) {
-        // FIX: Use plug->bass_history instead of static local
         plug->bass_history = 0.9f * plug->bass_history + 0.1f * target;
       }
 
       float dt = GetFrameTime();
       float smoothness_up = 20.0f + plug->bass_history * 10.0f;
       float smoothness_down = 4.5f + plug->bass_history * 2.0f;
+
+      // PROTECCIÓN ADICIONAL: Suavizado más agresivo durante estabilización
+      if (plug->is_stabilizing) {
+        smoothness_up *= 0.3f;   // Más lento al subir
+        smoothness_down *= 2.0f; // Más rápido al bajar
+      }
 
       if (target > plug->bars[i]) {
         plug->bars[i] += (target - plug->bars[i]) * smoothness_up * dt;
@@ -1201,7 +1229,8 @@ static void navigate_to_parent_dir(void) {
 static void draw_internal_browser(void) {
   if (!plug->show_browser)
     return;
-
+  if (!plug->has_music)
+    return;
   int w = GetRenderWidth();
   int h = GetRenderHeight();
   Rectangle browser_rec = {w * 0.1f, h * 0.1f, w * 0.8f, h * 0.8f};
